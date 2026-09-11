@@ -5,8 +5,9 @@
 #include <WiFiManager.h>
 #include <PubSubClient.h> // Library untuk MQTT
 
-#define SENSOR_PIN_1 35 // Sensor pertama (Modal Sanding)
-#define SENSOR_PIN_2 32 // Sensor kedua (Hasil Sanding - Dengan filter anti-noise)
+#define SENSOR_PIN_1 35  // Sensor pertama (Modal Sanding)
+#define SENSOR_PIN_2 32  // Sensor kedua (Hasil Sanding - Dengan filter anti-noise)
+#define WIFI_RESET_PIN 0 // Tombol BOOT bawaan ESP32 (GPIO0, aktif LOW)
 
 // Konfigurasi Broker MQTT Public
 const char *mqtt_server = "broker.hivemq.com";
@@ -51,8 +52,52 @@ const unsigned long WIFI_CHECK_INTERVAL = 5000;
 unsigned long lastReconnectAttempt = 0;
 const unsigned long RECONNECT_INTERVAL = 5000;
 
+// Variabel untuk Reset WiFi via Tombol BOOT (tekan-tahan)
+const unsigned long WIFI_RESET_HOLD_DURATION = 5000; // 5 detik tekan-tahan
+bool wifiResetButtonPressed = false;
+unsigned long wifiResetPressStart = 0;
+
 // Deklarasi fungsi callback agar bisa dibaca PubSubClient
 void callback(char *topic, byte *payload, unsigned int length);
+
+// Fungsi Cek Tombol Reset WiFi (non-blocking, tekan-tahan tombol BOOT 5 detik)
+void checkWiFiResetButton()
+{
+  int reading = digitalRead(WIFI_RESET_PIN);
+
+  if (reading == LOW) // Tombol BOOT aktif LOW saat ditekan
+  {
+    if (!wifiResetButtonPressed)
+    {
+      wifiResetButtonPressed = true;
+      wifiResetPressStart = millis();
+      Serial.println("Tombol BOOT ditekan, tahan 5 detik untuk reset WiFi...");
+    }
+    else if (millis() - wifiResetPressStart >= WIFI_RESET_HOLD_DURATION)
+    {
+      Serial.println("RESET WIFI DIMINTA! Menghapus kredensial tersimpan...");
+
+      if (client.connected())
+      {
+        client.publish("pabrik/veneer/status", "0", true);
+        client.disconnect();
+      }
+
+      WiFiManager wm;
+      wm.resetSettings(); // Hapus kredensial WiFi tersimpan
+      delay(500);
+      ESP.restart(); // Restart, akan otomatis membuka Config Portal karena belum ada kredensial
+    }
+  }
+  else
+  {
+    if (wifiResetButtonPressed)
+    {
+      Serial.println("Tombol BOOT dilepas sebelum 5 detik, reset dibatalkan.");
+    }
+    wifiResetButtonPressed = false;
+  }
+}
 
 // Fungsi Reconnect MQTT Non-Blocking dengan LWT (Last Will & Testament)
 void reconnectMQTT()
@@ -144,6 +189,15 @@ void callback(char *topic, byte *payload, unsigned int length)
       dtostrf(objectCount2, 1, 0, countString2);
       client.publish("pabrik/veneer/jumlah2", countString2);
     }
+    else if (message == "RESET_WIFI") // Reset WiFi juga bisa dipicu dari Dashboard, bukan cuma tombol fisik
+    {
+      Serial.println("RESET WIFI DIMINTA DARI DASHBOARD!");
+      client.publish("pabrik/veneer/status", "0", true);
+      WiFiManager wm;
+      wm.resetSettings();
+      delay(500);
+      ESP.restart();
+    }
   }
 }
 
@@ -184,6 +238,7 @@ void setup()
 
   pinMode(SENSOR_PIN_1, INPUT_PULLUP);
   pinMode(SENSOR_PIN_2, INPUT_PULLUP);
+  pinMode(WIFI_RESET_PIN, INPUT_PULLUP); // Tombol BOOT, idle HIGH, ditekan = LOW
 
   // WiFiManager dengan Timeout
   WiFiManager wm;
@@ -212,6 +267,9 @@ void setup()
 void loop()
 {
   unsigned long currentMillis = millis();
+
+  // 0. CEK TOMBOL RESET WIFI (BOOT, tekan-tahan 5 detik)
+  checkWiFiResetButton();
 
   // 1. PASTIKAN KONEKSI MQTT AKTIF
   if (WiFi.status() == WL_CONNECTED)
