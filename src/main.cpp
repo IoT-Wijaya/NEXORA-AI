@@ -57,6 +57,10 @@ const unsigned long WIFI_RESET_HOLD_DURATION = 5000; // 5 detik tekan-tahan
 bool wifiResetButtonPressed = false;
 unsigned long wifiResetPressStart = 0;
 
+// === TAMBAHAN BARU: Variabel Debug Monitor Serial (tidak bergantung WiFi/MQTT) ===
+unsigned long lastDebugPrint = 0;
+const unsigned long DEBUG_PRINT_INTERVAL = 1000; // cetak status tiap 1 detik
+
 // Deklarasi fungsi callback agar bisa dibaca PubSubClient
 void callback(char *topic, byte *payload, unsigned int length);
 
@@ -410,5 +414,46 @@ void loop()
       dtostrf(lastPrintedCount2, 1, 0, countString2);
       client.publish("pabrik/veneer/jumlah2", countString2);
     }
+  }
+
+  // === TAMBAHAN BARU 7. DEBUG MONITOR: Tampilkan status sensor & WiFi secara berkala ===
+  // Blok ini TIDAK bergantung pada WiFi/MQTT, murni membaca kondisi pin fisik ESP32.
+  // Berguna untuk memastikan sensor benar-benar "hidup" (bukan hanya diam karena tidak ada objek).
+  if (currentMillis - lastDebugPrint >= DEBUG_PRINT_INTERVAL)
+  {
+    lastDebugPrint = currentMillis;
+
+    Serial.println("---- STATUS MONITOR ----");
+
+    // Status sensor mentah (langsung dari pin, tidak butuh WiFi/internet)
+    Serial.print("Sensor 1 (pin 35): ");
+    Serial.print(digitalRead(SENSOR_PIN_1) == LOW ? "TERDETEKSI (LOW)" : "idle (HIGH)");
+    Serial.print("  | Total: ");
+    Serial.println(objectCount1);
+
+    Serial.print("Sensor 2 (pin 32): ");
+    Serial.print(digitalRead(SENSOR_PIN_2) == LOW ? "TERDETEKSI (LOW)" : "idle (HIGH)");
+    Serial.print("  | Total: ");
+    Serial.println(objectCount2);
+
+    // Status WiFi (koneksi ke router, tidak butuh internet)
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      Serial.print("WiFi: TERHUBUNG ke ");
+      Serial.print(WiFi.SSID());
+      Serial.print(" | Sinyal: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+    }
+    else
+    {
+      Serial.println("WiFi: TIDAK TERHUBUNG");
+    }
+
+    // Status MQTT (butuh internet ke broker, terpisah dari status WiFi)
+    Serial.print("MQTT Broker: ");
+    Serial.println(client.connected() ? "TERHUBUNG" : "TIDAK TERHUBUNG");
+
+    Serial.println("------------------------");
   }
 }
