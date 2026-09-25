@@ -1,459 +1,462 @@
-// YWROBOT
-// Compatible with the Arduino IDE 1.0
-// Library version:1.1
+// ============================================================================
+// VENEER / PLYWOOD COUNTER - ESP32 + W5500 + LCD 20x4 + MQTT VPS
+// INDIKATOR STATUS LAN & MQTT DETAIL DI LCD
+// ============================================================================
+
 #include <Wire.h>
-#include <WiFiManager.h>
-#include <PubSubClient.h> // Library untuk MQTT
+#include <SPI.h>
+#include <Ethernet.h>
+#include <PubSubClient.h>
+#include <LiquidCrystal_I2C.h>
 
-#define SENSOR_PIN_1 35  // Sensor pertama (Modal Sanding)
-#define SENSOR_PIN_2 32  // Sensor kedua (Hasil Sanding - Dengan filter anti-noise)
-#define WIFI_RESET_PIN 0 // Tombol BOOT bawaan ESP32 (GPIO0, aktif LOW)
+// ===================== PIN =====================
+#define SENSOR_PIN_1     27  // Sensor Hasil Sanding Besar
+#define SENSOR_PIN_2     32  // Sensor Modal Sanding Otomatis
+#define RESET_BUTTON_PIN  0  // Tombol Reset ESP32 (BOOT)
 
-// Konfigurasi Broker MQTT Public
-const char *mqtt_server = "broker.hivemq.com";
-const int mqtt_port = 1883;
+// Pin SPI Hardware ESP32 untuk W5500
+#define W5500_CS_PIN   5
+#define W5500_SCK_PIN  18
+#define W5500_MISO_PIN 19
+#define W5500_MOSI_PIN 23
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+// ===================== MQTT VPS CONFIG =====================
+const char *mqtt_server = "IP_PUBLIC_VPS"; // <-- Ganti dengan IP Public VPS Anda
+const uint16_t mqtt_port = 1883;
 
-// Variabel Counter Sensor 1 & 2
-unsigned long objectCount1 = 0;
-unsigned long lastPrintedCount1 = 999999;
-unsigned long objectCount2 = 0;
-unsigned long lastPrintedCount2 = 999999;
+#define TOPIK_STATUS   "pabrik/veneer/status"
+#define TOPIK_JUMLAH1  "pabrik/veneer/jumlah"
+#define TOPIK_JUMLAH2  "pabrik/veneer/jumlah2"
+#define TOPIK_IP       "pabrik/veneer/ip"
+#define TOPIK_PERINTAH "pabrik/veneer/perintah"
 
-// Variabel sensor & debounce Sensor 1
-int lastSensorState1 = HIGH;
-unsigned long lastDebounceTime1 = 0;
-unsigned long debounceDelay1 = 150;
+byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01};
 
-// Variabel sensor & debounce Sensor 2 (Dibuat lebih ketat untuk meredam noise)
-int lastSensorState2 = HIGH;
-unsigned long lastDebounceTime2 = 0;
-unsigned long debounceDelay2 = 300;
-bool counted2 = false;
+// ===================== OBJEK =====================
+EthernetClient ethClient;
+PubSubClient client(ethClient);
+LiquidCrystal_I2C lcd(0x27, 20, 4); // LCD 20x4
 
-// Variabel Deteksi Error Hardware Sensor dari ESP32
-bool currentError1 = false;
-bool currentError2 = false;
-bool lastReportedError1 = false;
-bool lastReportedError2 = false;
-unsigned long lastErrorCheck = 0;
+// ===================== COUNTER & PRODUKSI =====================
+portMUX_TYPE countMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t objectCount1 = 0; // Hasil Sanding (Sensor 1)
+volatile uint32_t objectCount2 = 0; // Modal Sanding (Sensor 2)
 
-// Waktu Timing LCD
-const unsigned long INTERVAL_MATI = 30 * 60 * 1000UL;
-const unsigned long DURASI_NYALA = 5 * 60 * 1000UL;
-unsigned long timerLCD = 0;
-bool lcdAktif = true;
+uint32_t lastPublishedCount1 = UINT32_MAX;
+uint32_t lastPublishedCount2 = UINT32_MAX;
 
-// Timing Pengecekan Sinyal & MQTT Reconnect Non-Blocking
-unsigned long lastWiFiCheck = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 5000;
-unsigned long lastReconnectAttempt = 0;
-const unsigned long RECONNECT_INTERVAL = 5000;
+// ===================== FILTER SENSOR =====================
+const uint32_t S1_PRESS_STABLE_MS   = 100;
+const uint32_t S1_RELEASE_STABLE_MS = 400;
+const uint32_t S2_PRESS_STABLE_MS   = 100;
+const uint32_t S2_RELEASE_STABLE_MS = 400;
 
-// Variabel untuk Reset WiFi via Tombol BOOT (tekan-tahan)
-const unsigned long WIFI_RESET_HOLD_DURATION = 5000; // 5 detik tekan-tahan
-bool wifiResetButtonPressed = false;
-unsigned long wifiResetPressStart = 0;
+struct SensorFilter {
+  uint8_t pin;
+  uint32_t pressStableMs;
+  uint32_t releaseStableMs;
+  int lastRaw;
+  uint32_t lastChange;
+  bool armed;
+  const char *nama;
+};
 
-// === TAMBAHAN BARU: Variabel Debug Monitor Serial (tidak bergantung WiFi/MQTT) ===
-unsigned long lastDebugPrint = 0;
-const unsigned long DEBUG_PRINT_INTERVAL = 1000; // cetak status tiap 1 detik
+SensorFilter sensor1 = {
+  SENSOR_PIN_1, S1_PRESS_STABLE_MS, S1_RELEASE_STABLE_MS,
+  HIGH, 0, true, "S1"
+};
 
-// Deklarasi fungsi callback agar bisa dibaca PubSubClient
-void callback(char *topic, byte *payload, unsigned int length);
+SensorFilter sensor2 = {
+  SENSOR_PIN_2, S2_PRESS_STABLE_MS, S2_RELEASE_STABLE_MS,
+  HIGH, 0, true, "S2"
+};
 
-// Fungsi Cek Tombol Reset WiFi (non-blocking, tekan-tahan tombol BOOT 5 detik)
-void checkWiFiResetButton()
-{
-  int reading = digitalRead(WIFI_RESET_PIN);
+// ===================== STATUS NETWORK =====================
+enum NetStatus : uint8_t {
+  NET_MEMULAI,
+  NET_LAN_GAGAL,
+  NET_LINK_OFF,
+  NET_MQTT_BELUM,
+  NET_ONLINE
+};
 
-  if (reading == LOW) // Tombol BOOT aktif LOW saat ditekan
-  {
-    if (!wifiResetButtonPressed)
-    {
-      wifiResetButtonPressed = true;
-      wifiResetPressStart = millis();
-      Serial.println("Tombol BOOT ditekan, tahan 5 detik untuk reset WiFi...");
+volatile NetStatus netStatus = NET_MEMULAI;
+volatile int mqttStateCode = -1;
+volatile uint32_t lanLostCount = 0;
+volatile uint32_t mqttLostCount = 0;
+volatile bool gRestartRequested = false;
+
+char ipText[16] = "-";
+
+// ===================== LCD & TIMER =====================
+uint32_t lastLCDUpdate = 0;
+const uint32_t LCD_UPDATE_INTERVAL = 300;
+
+unsigned long lastNetReportInterval = 0;
+const uint32_t NET_REPORT_INTERVAL = 60000; 
+
+// ===================== NETWORK TASK STATE =====================
+bool ethernetSiap = false;
+bool lastLinkState = false;
+bool lastMqttState = false;
+uint32_t lastReconnectAttempt = 0;
+const uint32_t RECONNECT_INTERVAL = 5000;
+uint32_t lastDhcpRenewCheck = 0;
+const uint32_t DHCP_RENEW_INTERVAL = 1000;
+uint32_t lastHeartbeat = 0;
+const uint32_t HEARTBEAT_INTERVAL = 15000;
+
+uint8_t linkOffSamples = 0;
+const uint8_t LINK_OFF_CONFIRM_SAMPLES = 2;
+
+// ============================================================================
+// ATOMIC COUNTER HELPERS
+// ============================================================================
+uint32_t readCount1() {
+  uint32_t value;
+  portENTER_CRITICAL(&countMux);
+  value = objectCount1;
+  portEXIT_CRITICAL(&countMux);
+  return value;
+}
+
+uint32_t readCount2() {
+  uint32_t value;
+  portENTER_CRITICAL(&countMux);
+  value = objectCount2;
+  portEXIT_CRITICAL(&countMux);
+  return value;
+}
+
+void incrementCount1() {
+  portENTER_CRITICAL(&countMux);
+  objectCount1++;
+  portEXIT_CRITICAL(&countMux);
+}
+
+void incrementCount2() {
+  portENTER_CRITICAL(&countMux);
+  objectCount2++;
+  portEXIT_CRITICAL(&countMux);
+}
+
+void resetCounters(bool s1, bool s2) {
+  portENTER_CRITICAL(&countMux);
+  if (s1) objectCount1 = 0;
+  if (s2) objectCount2 = 0;
+  portEXIT_CRITICAL(&countMux);
+}
+
+// ============================================================================
+// SENSOR TASK (CORE 0)
+// ============================================================================
+void initSensor(SensorFilter &s) {
+  s.lastRaw = digitalRead(s.pin);
+  s.armed = (s.lastRaw == HIGH);
+  s.lastChange = millis();
+}
+
+bool updateSensor(SensorFilter &s, uint32_t now) {
+  int raw = digitalRead(s.pin);
+
+  if (raw != s.lastRaw) {
+    s.lastRaw = raw;
+    s.lastChange = now;
+  }
+
+  uint32_t stableFor = now - s.lastChange;
+
+  if (s.armed) {
+    if (raw == LOW && stableFor >= s.pressStableMs) {
+      s.armed = false;
+      return true;
     }
-    else if (millis() - wifiResetPressStart >= WIFI_RESET_HOLD_DURATION)
-    {
-      Serial.println("RESET WIFI DIMINTA! Menghapus kredensial tersimpan...");
-
-      if (client.connected())
-      {
-        client.publish("pabrik/veneer/status", "0", true);
-        client.disconnect();
-      }
-
-      WiFiManager wm;
-      wm.resetSettings(); // Hapus kredensial WiFi tersimpan
-      delay(500);
-      ESP.restart(); // Restart, akan otomatis membuka Config Portal karena belum ada kredensial
+  } else {
+    if (raw == HIGH && stableFor >= s.releaseStableMs) {
+      s.armed = true;
     }
   }
-  else
-  {
-    if (wifiResetButtonPressed)
-    {
-      Serial.println("Tombol BOOT dilepas sebelum 5 detik, reset dibatalkan.");
-    }
-    wifiResetButtonPressed = false;
+  return false;
+}
+
+void sensorTask(void *param) {
+  (void)param;
+  for (;;) {
+    uint32_t now = millis();
+    if (updateSensor(sensor1, now)) incrementCount1();
+    if (updateSensor(sensor2, now)) incrementCount2();
+    vTaskDelay(pdMS_TO_TICKS(1)); 
   }
 }
 
-// Fungsi Reconnect MQTT Non-Blocking dengan LWT (Last Will & Testament)
-void reconnectMQTT()
-{
-  unsigned long now = millis();
-  if (now - lastReconnectAttempt >= RECONNECT_INTERVAL)
-  {
-    lastReconnectAttempt = now;
-
-    Serial.print("Menghubungkan ke MQTT Broker...");
-    String clientId = "ESP32VeneerClient-PabrikWijaya-";
-    clientId += String(random(0xffff), HEX);
-
-    // Menggunakan LWT: jika ESP32 mati mendadak/mati lampu, broker otomatis kirim "0" ke topik status
-    if (client.connect(clientId.c_str(), "", "", "pabrik/veneer/status", 0, true, "0"))
-    {
-      Serial.println("TERHUBUNG!");
-
-      // Kirim status awal ONLINE (1)
-      client.publish("pabrik/veneer/status", "1", true);
-
-      // Kirim ulang data counter saat ini
-      char countString1[10];
-      dtostrf(objectCount1, 1, 0, countString1);
-      client.publish("pabrik/veneer/jumlah", countString1);
-
-      char countString2[10];
-      dtostrf(objectCount2, 1, 0, countString2);
-      client.publish("pabrik/veneer/jumlah2", countString2);
-
-      String currentSSID = WiFi.SSID();
-      client.publish("pabrik/veneer/ssid", currentSSID.c_str(), true);
-
-      // Subscribe ke topik perintah dari Dashboard Filament
-      client.subscribe("pabrik/veneer/perintah");
-    }
-    else
-    {
-      Serial.print("Gagal, rc=");
-      Serial.print(client.state());
-      Serial.println(" Coba lagi dalam 5 detik.");
-    }
-  }
+// ============================================================================
+// NETWORK HELPERS
+// ============================================================================
+void catatIP() {
+  IPAddress ip = Ethernet.localIP();
+  snprintf(ipText, sizeof(ipText), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
 
-// Fungsi Callback untuk Menerima Pesan Masuk (Perintah Reset, dll)
-void callback(char *topic, byte *payload, unsigned int length)
-{
-  String message = "";
-  for (unsigned int i = 0; i < length; i++)
-  {
-    message += (char)payload[i];
-  }
+bool publishCount(const char *topic, uint32_t value) {
+  if (!client.connected()) return false;
+  char buf[11];
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)value);
+  return client.publish(topic, buf, true);
+}
 
-  Serial.print("Pesan masuk pada topik [");
+void publishS1() {
+  uint32_t c = readCount1();
+  if (publishCount(TOPIK_JUMLAH1, c)) lastPublishedCount1 = c;
+}
+
+void publishS2() {
+  uint32_t c = readCount2();
+  if (publishCount(TOPIK_JUMLAH2, c)) lastPublishedCount2 = c;
+}
+
+void restartDevice() {
+  Serial.println("Merestart ESP32...");
+  if (client.connected()) {
+    client.publish(TOPIK_STATUS, "0", true);
+    client.disconnect();
+  }
+  delay(300);
+  ESP.restart();
+}
+
+// ============================================================================
+// MQTT CALLBACK
+// ============================================================================
+void callback(char *topic, byte *payload, unsigned int length) {
+  char message[64];
+  unsigned int n = (length < sizeof(message) - 1) ? length : sizeof(message) - 1;
+  memcpy(message, payload, n);
+  message[n] = '\0';
+
+  Serial.print("MQTT [");
   Serial.print(topic);
   Serial.print("]: ");
   Serial.println(message);
 
-  if (String(topic) == "pabrik/veneer/perintah")
-  {
-    if (message == "RESET_S1")
-    {
-      objectCount1 = 0;
-      Serial.println("SENSOR 1 (MODAL) DI-RESET!");
-      char countString1[10];
-      dtostrf(objectCount1, 1, 0, countString1);
-      client.publish("pabrik/veneer/jumlah", countString1);
-    }
-    else if (message == "RESET_S2")
-    {
-      objectCount2 = 0;
-      Serial.println("SENSOR 2 (HASIL) DI-RESET!");
-      char countString2[10];
-      dtostrf(objectCount2, 1, 0, countString2);
-      client.publish("pabrik/veneer/jumlah2", countString2);
-    }
-    else if (message == "RESET_ALL" || message == "RESET")
-    {
-      objectCount1 = 0;
-      objectCount2 = 0;
-      Serial.println("SEMUA COUNTER DI-RESET!");
+  if (strcmp(topic, TOPIK_PERINTAH) != 0) return;
 
-      char countString1[10];
-      dtostrf(objectCount1, 1, 0, countString1);
-      client.publish("pabrik/veneer/jumlah", countString1);
-
-      char countString2[10];
-      dtostrf(objectCount2, 1, 0, countString2);
-      client.publish("pabrik/veneer/jumlah2", countString2);
-    }
-    else if (message == "RESET_WIFI") // Reset WiFi juga bisa dipicu dari Dashboard, bukan cuma tombol fisik
-    {
-      Serial.println("RESET WIFI DIMINTA DARI DASHBOARD!");
-      client.publish("pabrik/veneer/status", "0", true);
-      WiFiManager wm;
-      wm.resetSettings();
-      delay(500);
-      ESP.restart();
-    }
+  if (strcmp(message, "RESET_S1") == 0) {
+    resetCounters(true, false);
+    publishS1();
+  }
+  else if (strcmp(message, "RESET_S2") == 0) {
+    resetCounters(false, true);
+    publishS2();
+  }
+  else if (strcmp(message, "RESET_ALL") == 0 || strcmp(message, "RESET") == 0) {
+    resetCounters(true, true);
+    publishS1();
+    publishS2();
+  }
+  else if (strcmp(message, "RESTART_DEVICE") == 0) {
+    restartDevice();
   }
 }
 
-// Fungsi Evaluasi Teks Sinyal
-String getSignalStatus(int rssi)
-{
-  if (WiFi.status() != WL_CONNECTED)
-    return "Terputus";
-  if (rssi >= -65)
-    return "Kuat";
-  else if (rssi >= -75)
-    return "Sedang";
-  else
-    return "Lemah";
+void reconnectMQTT() {
+  uint32_t now = millis();
+  if (now - lastReconnectAttempt < RECONNECT_INTERVAL) return;
+  lastReconnectAttempt = now;
+
+  if (!ethernetSiap || !lastLinkState) return;
+
+  char clientId[64];
+  snprintf(clientId, sizeof(clientId),
+           "ESP32VeneerClient-%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  if (client.connect(clientId, TOPIK_STATUS, 0, true, "0")) {
+    client.publish(TOPIK_STATUS, "1", true);
+    client.subscribe(TOPIK_PERINTAH);
+    publishS1();
+    publishS2();
+
+    IPAddress ip = Ethernet.localIP();
+    char ipStr[16];
+    snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    client.publish(TOPIK_IP, ipStr, true);
+
+    lastHeartbeat = millis();
+  } else {
+    mqttStateCode = client.state();
+  }
 }
 
-// Estimasi Kecepatan Link (Mbps) berdasarkan RSSI untuk Dashboard
-int getEstimatedSpeedMbps(int rssi)
-{
-  if (WiFi.status() != WL_CONNECTED)
-    return 0;
-  if (rssi >= -55)
-    return 72;
-  else if (rssi >= -65)
-    return 54;
-  else if (rssi >= -75)
-    return 24;
-  else if (rssi >= -85)
-    return 6;
-  else
-    return 1;
+// ============================================================================
+// NETWORK TASK (CORE 1)
+// ============================================================================
+void networkTask(void *param) {
+  (void)param;
+  Ethernet.init(W5500_CS_PIN);
+  if (Ethernet.begin(mac) == 0) {
+    ethernetSiap = false;
+    netStatus = NET_LAN_GAGAL;
+  } else {
+    ethernetSiap = true;
+    catatIP();
+  }
+
+  lastLinkState = (Ethernet.linkStatus() == LinkON);
+  uint32_t lastLinkCheck = 0;
+
+  for (;;) {
+    uint32_t now = millis();
+
+    if (gRestartRequested) {
+      gRestartRequested = false;
+      restartDevice();
+    }
+
+    if (now - lastLinkCheck >= 500) {
+      lastLinkCheck = now;
+      EthernetLinkStatus rawLink = Ethernet.linkStatus();
+
+      if (rawLink == LinkON) {
+        linkOffSamples = 0;
+        if (!lastLinkState) lastLinkState = true;
+      } else if (rawLink == LinkOFF) {
+        if (linkOffSamples < 255) linkOffSamples++;
+        if (linkOffSamples >= LINK_OFF_CONFIRM_SAMPLES && lastLinkState) {
+          lastLinkState = false;
+          lanLostCount++;
+          if (client.connected()) client.disconnect();
+          lastMqttState = false;
+        }
+      }
+    }
+
+    if (ethernetSiap && lastLinkState) {
+      if (!client.connected()) {
+        if (lastMqttState) {
+          mqttLostCount++;
+          lastMqttState = false;
+        }
+        reconnectMQTT();
+        if (client.connected()) lastMqttState = true;
+      } else {
+        client.loop();
+        lastMqttState = true;
+      }
+    } else {
+      lastMqttState = false;
+    }
+
+    if (ethernetSiap && now - lastDhcpRenewCheck >= DHCP_RENEW_INTERVAL) {
+      lastDhcpRenewCheck = now;
+      Ethernet.maintain();
+    }
+
+    if (client.connected()) {
+      uint32_t c1 = readCount1();
+      uint32_t c2 = readCount2();
+      
+      if (c1 != lastPublishedCount1) {
+        if (publishCount(TOPIK_JUMLAH1, c1)) lastPublishedCount1 = c1;
+      }
+      if (c2 != lastPublishedCount2) {
+        if (publishCount(TOPIK_JUMLAH2, c2)) lastPublishedCount2 = c2;
+      }
+
+      if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+        lastHeartbeat = now;
+        client.publish(TOPIK_STATUS, "1", true);
+      }
+    }
+
+    if (!ethernetSiap) netStatus = NET_LAN_GAGAL;
+    else if (!lastLinkState) netStatus = NET_LINK_OFF;
+    else if (!client.connected()) netStatus = NET_MQTT_BELUM;
+    else netStatus = NET_ONLINE;
+
+    if (now - lastNetReportInterval >= NET_REPORT_INTERVAL) {
+      lastNetReportInterval = now;
+      Serial.print("[LAPORAN 1 MENIT] Status LAN: ");
+      Serial.print(lastLinkState ? "OK (Link ON)" : "PUTUS");
+      Serial.print(" | MQTT Broker: ");
+      Serial.println(client.connected() ? "Terhubung" : "Terputus");
+    }
+
+    mqttStateCode = client.state();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
 
-void setup()
-{
+// ============================================================================
+// SETUP & LOOP
+// ============================================================================
+void setup() {
   Serial.begin(115200);
+  delay(100);
+
   Wire.begin();
+  lcd.init();
+  lcd.backlight(); 
+  lcd.setCursor(0, 0);
+  lcd.print("Veneer Counter 20x4");
+  lcd.setCursor(0, 1);
+  lcd.print("Inisialisasi Sistem.");
 
   pinMode(SENSOR_PIN_1, INPUT_PULLUP);
   pinMode(SENSOR_PIN_2, INPUT_PULLUP);
-  pinMode(WIFI_RESET_PIN, INPUT_PULLUP); // Tombol BOOT, idle HIGH, ditekan = LOW
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
 
-  // WiFiManager dengan Timeout
-  WiFiManager wm;
-  wm.setConnectTimeout(15);
-  wm.setConfigPortalTimeout(60);
+  initSensor(sensor1);
+  initSensor(sensor2);
 
-  bool res = wm.autoConnect("ESP32-Veneer-Counter");
+  SPI.begin(W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN, W5500_CS_PIN);
 
-  if (!res)
-  {
-    Serial.println("Gagal terhubung ke WiFi!");
-  }
-  else
-  {
-    Serial.println("Terhubung ke WiFi!");
-  }
-
-  // Set Broker MQTT & Buffer Size & Callback
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
   client.setBufferSize(512);
+  client.setKeepAlive(30);
+  client.setSocketTimeout(10);
 
-  timerLCD = millis();
+  xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(networkTask, "networkTask", 12288, NULL, 1, NULL, 1);
+
+  delay(1500);
+  lcd.clear();
 }
 
-void loop()
-{
-  unsigned long currentMillis = millis();
+void loop() {
+  uint32_t currentMillis = millis();
+  uint32_t c1 = readCount1();
+  uint32_t c2 = readCount2();
 
-  // 0. CEK TOMBOL RESET WIFI (BOOT, tekan-tahan 5 detik)
-  checkWiFiResetButton();
+  // Update Tampilan LCD 20x4 Secara Kontinu dengan Status Terperinci
+  if (currentMillis - lastLCDUpdate >= LCD_UPDATE_INTERVAL) {
+    lastLCDUpdate = currentMillis;
 
-  // 1. PASTIKAN KONEKSI MQTT AKTIF
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    if (!client.connected())
-    {
-      reconnectMQTT();
-    }
-    else
-    {
-      client.loop();
-    }
-  }
+    char baris0[21];
+    char baris1[21];
+    char baris2[21];
+    char baris3[21];
 
-  // 2. KONTROL OTOMATIS BACKLIGHT LCD
-  if (lcdAktif)
-  {
-    if (currentMillis - timerLCD >= DURASI_NYALA)
-    {
-      lcdAktif = false;
-      timerLCD = currentMillis;
-    }
-  }
-  else
-  {
-    if (currentMillis - timerLCD >= INTERVAL_MATI)
-    {
-      lcdAktif = true;
-      timerLCD = currentMillis;
-    }
-  }
-
-  // 3. PENGECEKAN SINYAL WIFI & PUBLISH KE DASHBOARD
-  if (currentMillis - lastWiFiCheck >= WIFI_CHECK_INTERVAL)
-  {
-    lastWiFiCheck = currentMillis;
-    int rssi = WiFi.RSSI();
-    String statusSinyal = getSignalStatus(rssi);
-
-    if (client.connected())
-    {
-      int estSpeed = getEstimatedSpeedMbps(rssi);
-      char speedStr[10];
-      itoa(estSpeed, speedStr, 10);
-
-      client.publish("pabrik/veneer/kecepatan", speedStr);
-    }
-  }
-
-  // 4A. PENGHITUNGAN SENSOR PROXIMITY 1 (Pin 35)
-  int currentReading1 = digitalRead(SENSOR_PIN_1);
-  if (currentReading1 != lastSensorState1)
-  {
-    if ((currentMillis - lastDebounceTime1) > debounceDelay1)
-    {
-      if (currentReading1 == LOW)
-      {
-        objectCount1++;
-      }
-      lastDebounceTime1 = currentMillis;
-      lastSensorState1 = currentReading1;
-    }
-  }
-
-  // 4B. PENGHITUNGAN SENSOR PROXIMITY 2 (Pin 32) DENGAN FILTER ANTI-NOISE KETAT
-  int currentReading2 = digitalRead(SENSOR_PIN_2);
-  if (currentReading2 != lastSensorState2)
-  {
-    lastDebounceTime2 = currentMillis;
-    lastSensorState2 = currentReading2;
-  }
-
-  if (currentReading2 == LOW)
-  {
-    if (!counted2 && (currentMillis - lastDebounceTime2) > debounceDelay2)
-    {
-      objectCount2++;
-      counted2 = true;
-    }
-  }
-  else
-  {
-    counted2 = false;
-  }
-
-  // 5. DIAGNOSTIK HARDWARE ERROR DARI SISI ESP32 (Pengecekan tiap 2 detik)
-  if (currentMillis - lastErrorCheck >= 2000)
-  {
-    lastErrorCheck = currentMillis;
-
-    // Set normal (false) secara default
-    currentError1 = false;
-    currentError2 = false;
-
-    // Kirim status error ke broker MQTT jika terjadi perubahan status
-    if (client.connected())
-    {
-      if (currentError1 != lastReportedError1)
-      {
-        lastReportedError1 = currentError1;
-        client.publish("pabrik/veneer/s1_error", currentError1 ? "1" : "0", true);
-      }
-      if (currentError2 != lastReportedError2)
-      {
-        lastReportedError2 = currentError2;
-        client.publish("pabrik/veneer/s2_error", currentError2 ? "1" : "0", true);
-      }
-    }
-  }
-
-  // 6A. UPDATE TAMPILAN JUMLAH & PUBLISH MQTT SENSOR 1
-  if (objectCount1 != lastPrintedCount1)
-  {
-    lastPrintedCount1 = objectCount1;
-
-    Serial.print("Sensor 1 Terdeteksi! Total: ");
-    Serial.println(lastPrintedCount1);
-
-    if (client.connected())
-    {
-      char countString1[10];
-      dtostrf(lastPrintedCount1, 1, 0, countString1);
-      client.publish("pabrik/veneer/jumlah", countString1);
-    }
-  }
-
-  // 6B. UPDATE TAMPILAN JUMLAH & PUBLISH MQTT SENSOR 2
-  if (objectCount2 != lastPrintedCount2)
-  {
-    lastPrintedCount2 = objectCount2;
-
-    Serial.print("Sensor 2 (Anti-Noise) Terdeteksi! Total: ");
-    Serial.println(lastPrintedCount2);
-
-    if (client.connected())
-    {
-      char countString2[10];
-      dtostrf(lastPrintedCount2, 1, 0, countString2);
-      client.publish("pabrik/veneer/jumlah2", countString2);
-    }
-  }
-
-  // === TAMBAHAN BARU 7. DEBUG MONITOR: Tampilkan status sensor & WiFi secara berkala ===
-  // Blok ini TIDAK bergantung pada WiFi/MQTT, murni membaca kondisi pin fisik ESP32.
-  // Berguna untuk memastikan sensor benar-benar "hidup" (bukan hanya diam karena tidak ada objek).
-  if (currentMillis - lastDebugPrint >= DEBUG_PRINT_INTERVAL)
-  {
-    lastDebugPrint = currentMillis;
-
-    Serial.println("---- STATUS MONITOR ----");
-
-    // Status sensor mentah (langsung dari pin, tidak butuh WiFi/internet)
-    Serial.print("Sensor 1 (pin 35): ");
-    Serial.print(digitalRead(SENSOR_PIN_1) == LOW ? "TERDETEKSI (LOW)" : "idle (HIGH)");
-    Serial.print("  | Total: ");
-    Serial.println(objectCount1);
-
-    Serial.print("Sensor 2 (pin 32): ");
-    Serial.print(digitalRead(SENSOR_PIN_2) == LOW ? "TERDETEKSI (LOW)" : "idle (HIGH)");
-    Serial.print("  | Total: ");
-    Serial.println(objectCount2);
-
-    // Status WiFi (koneksi ke router, tidak butuh internet)
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      Serial.print("WiFi: TERHUBUNG ke ");
-      Serial.print(WiFi.SSID());
-      Serial.print(" | Sinyal: ");
-      Serial.print(WiFi.RSSI());
-      Serial.println(" dBm");
-    }
-    else
-    {
-      Serial.println("WiFi: TIDAK TERHUBUNG");
+    // Logika Pemetaan Teks Status di Baris 0
+    if (!ethernetSiap || netStatus == NET_LAN_GAGAL) {
+      snprintf(baris0, sizeof(baris0), "CEK KABEL/LAN: FAIL ");
+    } else if (!lastLinkState || netStatus == NET_LINK_OFF) {
+      snprintf(baris0, sizeof(baris0), "LAN: OFF  MQTT: NG  ");
+    } else if (netStatus == NET_MQTT_BELUM) {
+      snprintf(baris0, sizeof(baris0), "LAN: OK   MQTT: NG  ");
+    } else {
+      snprintf(baris0, sizeof(baris0), "LAN: OK   MQTT: OK  ");
     }
 
-    // Status MQTT (butuh internet ke broker, terpisah dari status WiFi)
-    Serial.print("MQTT Broker: ");
-    Serial.println(client.connected() ? "TERHUBUNG" : "TIDAK TERHUBUNG");
+    snprintf(baris1, sizeof(baris1), "SANDING BESAR       ");
+    snprintf(baris2, sizeof(baris2), "Modal  : %-11lu", (unsigned long)c2);
+    snprintf(baris3, sizeof(baris3), "Hasil  : %-11lu", (unsigned long)c1);
 
-    Serial.println("------------------------");
+    lcd.setCursor(0, 0); lcd.print(baris0);
+    lcd.setCursor(0, 1); lcd.print(baris1);
+    lcd.setCursor(0, 2); lcd.print(baris2);
+    lcd.setCursor(0, 3); lcd.print(baris3);
   }
+
+  delay(2);
 }
