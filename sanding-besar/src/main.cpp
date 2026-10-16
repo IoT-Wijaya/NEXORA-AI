@@ -19,6 +19,7 @@
 #define W5500_SCK_PIN  18
 #define W5500_MISO_PIN 19
 #define W5500_MOSI_PIN 23
+#define W5500_RST_PIN 4
 
 // ===================== MQTT VPS CONFIG =====================
 const char *mqtt_server = "IP_PUBLIC_VPS"; // <-- Ganti dengan IP Public VPS Anda
@@ -224,6 +225,17 @@ void restartDevice() {
   ESP.restart();
 }
 
+void resetW5500() {
+  digitalWrite(W5500_RST_PIN, LOW);
+  delay(50);
+  digitalWrite(W5500_RST_PIN, HIGH);
+  delay(500);  // beri waktu chip bangun
+
+  Ethernet.init(W5500_CS_PIN);
+  ethernetSiap = (Ethernet.begin(mac, 5000, 2000) != 0);
+  if (ethernetSiap) catatIP();
+}
+
 // ============================================================================
 // MQTT CALLBACK
 // ============================================================================
@@ -373,6 +385,21 @@ void networkTask(void *param) {
     else if (!client.connected()) netStatus = NET_MQTT_BELUM;
     else netStatus = NET_ONLINE;
 
+    static uint32_t mqttDownSince = 0;
+    static bool sudahResetChip = false;
+
+    if (netStatus == NET_ONLINE || !lastLinkState) {
+      mqttDownSince = 0;
+      sudahResetChip = false;
+    } else if (mqttDownSince == 0) {
+      mqttDownSince = now;
+    } else if (!sudahResetChip && now - mqttDownSince > 5UL * 60UL * 1000UL) {
+      sudahResetChip = true;
+      resetW5500();                       // langkah 1: reset chip
+    } else if (now - mqttDownSince > 10UL * 60UL * 1000UL) {
+      restartDevice();                    // langkah 2: restart total
+    }
+
     if (now - lastNetReportInterval >= NET_REPORT_INTERVAL) {
       lastNetReportInterval = now;
       Serial.print("[LAPORAN 1 MENIT] Status LAN: ");
@@ -404,6 +431,8 @@ void setup() {
   pinMode(SENSOR_PIN_1, INPUT_PULLUP);
   pinMode(SENSOR_PIN_2, INPUT_PULLUP);
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(W5500_RST_PIN, OUTPUT);
+  digitalWrite(W5500_RST_PIN, HIGH);
 
   initSensor(sensor1);
   initSensor(sensor2);
