@@ -41,7 +41,7 @@ PubSubClient client(ethClient);
 // =====================================================
 // MQTT
 // =====================================================
-const char *mqtt_server = "103.27.206.23";
+const char *mqtt_server = "IP_VPS_PRIBADI";
 const int mqtt_port = 1883;
 
 const char *mqtt_user = "";
