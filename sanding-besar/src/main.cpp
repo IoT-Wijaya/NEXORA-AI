@@ -443,7 +443,7 @@ void loop() {
     } else if (!lastLinkState || netStatus == NET_LINK_OFF) {
       snprintf(baris0, sizeof(baris0), "LAN: OFF  MQTT: NG  ");
     } else if (netStatus == NET_MQTT_BELUM) {
-      snprintf(baris0, sizeof(baris0), "LAN: OK   MQTT: NG  ");
+      snprintf(baris0, sizeof(baris0), "LAN:OK MQTT:NG e=%-3d", (int)mqttStateCode);
     } else {
       snprintf(baris0, sizeof(baris0), "LAN: OK   MQTT: OK  ");
     }
