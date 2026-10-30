@@ -2,13 +2,17 @@ name: Build ESP32 Firmware Multi-Device
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
-      - 'counter-sanding-besar/**'
-      - 'counter-sanding-kecil/**'
-      - 'input-display/**'
+      - "counter-sanding-besar/**"
+      - "counter-sanding-kecil/**"
+      - "input-display/**"
   pull_request:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - "counter-sanding-besar/**"
+      - "counter-sanding-kecil/**"
+      - "input-display/**"
 
 jobs:
   build-firmware:
@@ -16,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        # Daftar folder perangkat ESP32 Anda di GitHub
         device: [counter-sanding-besar, counter-sanding-kecil, input-display]
 
     steps:
@@ -27,12 +31,12 @@ jobs:
           submodules: recursive
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Cache PlatformIO Dependencies
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.platformio
@@ -54,6 +58,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.device }}
+          retention-days: 7 # artifact CI cukup disimpan seminggu
           path: |
             ${{ matrix.device }}/.pio/build/*/firmware.bin
             ${{ matrix.device }}/.pio/build/*/bootloader.bin

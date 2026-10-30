@@ -1,0 +1,98 @@
+name: Release Firmware
+
+on:
+  push:
+    tags:
+      - "*-v[0-9]*" # contoh: counter-sanding-besar-v2026.10.20
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Perangkat yang dirilis"
+        type: choice
+        required: true
+        options:
+          - counter-sanding-besar
+          - counter-sanding-kecil
+          - input-display
+      version:
+        description: "Versi, contoh: v2026.10.20"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      # Nilai dari input dilewatkan lewat env, bukan ditempel langsung ke script (lebih aman)
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_DEVICE: ${{ inputs.device }}
+      INPUT_VERSION: ${{ inputs.version }}
+      REF_NAME: ${{ github.ref_name }}
+
+    steps:
+      - name: Tentukan perangkat dan versi
+        id: meta
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            DEVICE="$INPUT_DEVICE"
+            VERSION="$INPUT_VERSION"
+          else
+            # "counter-sanding-besar-v2026.10.20" -> device & version
+            DEVICE="${REF_NAME%-v[0-9]*}"
+            VERSION="v${REF_NAME##*-v}"
+          fi
+
+          if ! [[ "$VERSION" =~ ^v[0-9][0-9.]*$ ]]; then
+            echo "Format versi salah: $VERSION (harus seperti v2026.10.20)"; exit 1
+          fi
+
+          echo "device=$DEVICE"           >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"         >> "$GITHUB_OUTPUT"
+          echo "tag=$DEVICE-$VERSION"     >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pastikan folder perangkat valid
+        run: test -f "${{ steps.meta.outputs.device }}/platformio.ini" || { echo "Folder atau platformio.ini tidak ditemukan"; exit 1; }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ runner.os }}-pio-${{ hashFiles(format('{0}/platformio.ini', steps.meta.outputs.device)) }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      - run: pip install platformio
+
+      - name: Build
+        working-directory: ./${{ steps.meta.outputs.device }}
+        env:
+          PLATFORMIO_BUILD_FLAGS: '-DFW_VERSION=\"${{ steps.meta.outputs.version }}\"'
+        run: pio run
+
+      - name: Siapkan file release
+        run: |
+          BIN=$(find "${{ steps.meta.outputs.device }}/.pio/build" -name firmware.bin | head -n 1)
+          test -f "$BIN" || { echo "firmware.bin tidak ditemukan"; exit 1; }
+          mkdir -p dist
+          cp "$BIN" "dist/${{ steps.meta.outputs.tag }}.bin"
+
+      - name: Buat release (draft, upload, lalu publish)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          gh release create "$TAG" "dist/$TAG.bin" \
+            --title "$TAG" --generate-notes --draft --target "$GITHUB_SHA"
+          gh release edit "$TAG" --draft=false
