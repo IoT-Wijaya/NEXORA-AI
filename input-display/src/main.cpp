@@ -77,7 +77,6 @@ struct ErrInfo
   const char *saran;
   const char *detail;
 };
-ErrInfo infoError(int code);
 
 // Hasil dari satu request HTTP:
 // - status: kode HTTP (200, 401, ...) ATAU kode error negatif buatan kita
@@ -87,6 +86,32 @@ struct HttpHasil
   int status;
   String body;
 };
+
+// =====================================================
+//  PROTOTIPE FUNGSI
+//  PlatformIO tidak membuat prototipe otomatis seperti Arduino IDE,
+//  jadi fungsi yang dipanggil sebelum didefinisikan harus dideklarasikan di sini.
+// =====================================================
+ErrInfo infoError(int code);
+void resetHitungan();
+bool fetchDataFromAPI(bool silent);
+void selesaikanSesi();
+
+void handleFetchApi();
+void handlePilihDataMenu();
+void handlePilihSisiMenu();
+void handleSandingRunning();
+void handleKoreksiManual();
+void handleValidasiMenu();
+void handleKonfirmasiLagi();
+void kirimDataKeServer();
+
+void updateDisplayKosong();
+void updateDisplayPilihData();
+void updateDisplayPilihSisi();
+void updateDisplayKoreksi();
+void updateDisplayValidasi();
+void updateDisplayKonfirmasi();
 
 // Alamat server dipecah SEKALI di setup, tidak diulang-ulang
 IPAddress serverAddr;
@@ -546,7 +571,7 @@ HttpHasil httpRequest(const char *method, const String &path, const String &body
   ethClient.println(String(method) + " " + path + " HTTP/1.0");
   ethClient.println("Host: " + String(serverIp));
   ethClient.println("Accept: application/json");
-  // ethClient.println("X-API-KEY: " + String(apiKey));
+  // ethClient.println("X-API-KEY: " + String(apiKey)); // dinonaktifkan sementara
   ethClient.println("Connection: close");
   if (body.length() > 0)
   {
