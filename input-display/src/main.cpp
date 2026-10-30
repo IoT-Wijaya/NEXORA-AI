@@ -4,6 +4,7 @@
 #include <Ethernet.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
+#include "secrets.h"
 #include "config.h"
 
 const char *topicMasuk = "pabrik/sanding/jumlah";
@@ -373,6 +374,26 @@ void resetHitungan()
   koreksiField = 0;
 }
 
+void siapkanMac()
+{
+  // MAC bawaan chip ESP32 (unik, tidak berubah)
+  uint64_t chipId = ESP.getEfuseMac();
+  for (int i = 0; i < 6; i++)
+    mac[i] = (chipId >> (8 * (5 - i))) & 0xFF;
+
+  // Bit 1 di byte pertama = "locally administered", dipakai untuk MAC buatan
+  // pada antarmuka W5500, supaya tidak bentrok dengan MAC WiFi chip yang sama.
+  mac[0] = (mac[0] | 0x02) & 0xFE;
+}
+
+String macString()
+{
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
 void kembaliKeMonitoring()
 {
   adaKoreksiManual = false;
@@ -526,7 +547,7 @@ HttpHasil httpRequest(const char *method, const String &path, const String &body
   ethClient.println(String(method) + " " + path + " HTTP/1.0");
   ethClient.println("Host: " + String(serverIp));
   ethClient.println("Accept: application/json");
-  ethClient.println("X-API-KEY: " + String(apiKey));
+  // ethClient.println("X-API-KEY: " + String(apiKey));
   ethClient.println("Connection: close");
   if (body.length() > 0)
   {
@@ -1308,24 +1329,4 @@ void selesaikanSesi()
   fetchDataFromAPI(false);
   lastPollMs = millis();
   currentState = STATE_FETCH_API;
-}
-
-void siapkanMac()
-{
-  // MAC bawaan chip ESP32 (unik, tidak berubah)
-  uint64_t chipId = ESP.getEfuseMac();
-  for (int i = 0; i < 6; i++)
-    mac[i] = (chipId >> (8 * (5 - i))) & 0xFF;
-
-  // Bit 1 di byte pertama = "locally administered", dipakai untuk MAC buatan
-  // pada antarmuka W5500, supaya tidak bentrok dengan MAC WiFi chip yang sama.
-  mac[0] = (mac[0] | 0x02) & 0xFE;
-}
-
-String macString()
-{
-  char buf[18];
-  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  return String(buf);
 }
