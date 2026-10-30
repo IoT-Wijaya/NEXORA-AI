@@ -4,7 +4,6 @@
 #include <Ethernet.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
-#include "secrets.h"
 #include "config.h"
 
 const char *topicMasuk = "pabrik/sanding/jumlah";
