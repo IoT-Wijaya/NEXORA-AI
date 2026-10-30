@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include "secrets.h"
+#include "config.h"
 
 const char *topicMasuk = "pabrik/sanding/jumlah";
 const char *topicKeluar = "pabrik/sanding/jumlah2";
@@ -16,7 +17,8 @@ const char *topicMode = "pabrik/sanding/mode";
 // =====================================================
 //  KONFIGURASI ETHERNET W5500 (SPI: SCK=18, MISO=23, MOSI=19, CS=16)
 // =====================================================
-byte mac[] = DEVICE_MAC;
+byte mac[6];
+
 const int ETHERNET_CS_PIN = 16;
 
 // =====================================================
@@ -429,6 +431,9 @@ void setup()
   // Inisialisasi SPI W5500 (SCK=18, MISO=23, MOSI=19, SS=16)
   SPI.begin(18, 23, 19, ETHERNET_CS_PIN);
   Ethernet.init(ETHERNET_CS_PIN);
+
+  siapkanMac();
+  Serial.println("MAC perangkat: " + macString());
 
   if (Ethernet.begin(mac) == 0)
   {
@@ -1304,4 +1309,24 @@ void selesaikanSesi()
   fetchDataFromAPI(false);
   lastPollMs = millis();
   currentState = STATE_FETCH_API;
+}
+
+void siapkanMac()
+{
+  // MAC bawaan chip ESP32 (unik, tidak berubah)
+  uint64_t chipId = ESP.getEfuseMac();
+  for (int i = 0; i < 6; i++)
+    mac[i] = (chipId >> (8 * (5 - i))) & 0xFF;
+
+  // Bit 1 di byte pertama = "locally administered", dipakai untuk MAC buatan
+  // pada antarmuka W5500, supaya tidak bentrok dengan MAC WiFi chip yang sama.
+  mac[0] = (mac[0] | 0x02) & 0xFE;
+}
+
+String macString()
+{
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
 }
