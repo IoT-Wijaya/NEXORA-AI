@@ -5,6 +5,11 @@
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include "config.h"
+#include <Preferences.h>
+#include <Update.h>
+#include "mbedtls/sha256.h"
+#include "esp_task_wdt.h"
+#include "esp_system.h"
 
 const char *topicMasuk = "pabrik/sanding/jumlah";
 const char *topicKeluar = "pabrik/sanding/jumlah2";
@@ -34,6 +39,7 @@ const int ERR_DATA_TIDAK_VALID = -101;
 
 EthernetClient ethClient;
 PubSubClient client(ethClient);
+EthernetClient httpClient;
 
 // =====================================================
 //  LCD I2C (20x4)
@@ -87,15 +93,26 @@ struct HttpHasil
   String body;
 };
 
+HttpHasil httpRequest(const char *method, const String &path, const String &body,
+                      const char *namaHeader = nullptr, const String &nilaiHeader = "");
+
 // =====================================================
 //  PROTOTIPE FUNGSI
 //  PlatformIO tidak membuat prototipe otomatis seperti Arduino IDE,
 //  jadi fungsi yang dipanggil sebelum didefinisikan harus dideklarasikan di sini.
 // =====================================================
 ErrInfo infoError(int code);
+String macString(); // tambahkan
+void siapkanMac();
 void resetHitungan();
 bool fetchDataFromAPI(bool silent);
 void selesaikanSesi();
+
+void publishIP();
+void publishDiag();
+void restartDevice(const char *alasan);
+HttpHasil httpRequestRaw(const char *method, const String &path, const String &body,
+                         const char *namaHeader, const String &nilaiHeader);
 
 void handleFetchApi();
 void handlePilihDataMenu();
@@ -193,6 +210,337 @@ const bool IZINKAN_BATAL_TAHAN = true;
 const unsigned long TAHAN_BATAL_MS = 3000; // tahan BACK sekian ms untuk batal
 unsigned long backTahanMulai = 0;
 
+// =====================================================
+//  PEMANTAUAN JARINGAN (LAN, MQTT, HTTP) KE DASHBOARD
+// =====================================================
+#define TOPIC_HMI "pabrik/hmi_sanding/" // ganti sesuai kebutuhan
+const char *topicHmiStatus = TOPIC_HMI "status";
+const char *topicHmiIP = TOPIC_HMI "ip";
+const char *topicHmiDiag = TOPIC_HMI "diag";
+const char *topicHmiPerintah = TOPIC_HMI "perintah";
+
+const unsigned long ETH_CHECK_INTERVAL = 3000UL;
+const unsigned long DHCP_RETRY_INTERVAL = 15000UL;
+const unsigned long MQTT_RETRY_MIN = 2000UL;
+const unsigned long MQTT_RETRY_MAX = 60000UL;
+const unsigned long HEARTBEAT_INTERVAL = 5000UL; // dashboard anggap OFFLINE jika > 15 detik
+const unsigned long DIAG_INTERVAL = 60000UL;
+const unsigned long RESET_ETH_AFTER = 5UL * 60UL * 1000UL;
+const unsigned long RESTART_AFTER = 10UL * 60UL * 1000UL;
+const uint8_t LINK_OFF_CONFIRM = 2;
+const uint32_t WDT_TIMEOUT_S = 60;
+
+enum NetState : uint8_t
+{
+  NS_KABEL_PUTUS = 0,
+  NS_TANPA_IP = 1,
+  NS_MQTT_NG = 2,
+  NS_ONLINE = 3
+};
+
+bool linkUp = false, lanOK = false, mqttOK = false;
+int mqttErr = -1, lastErrSeen = 0;
+uint8_t linkOffSamples = 0;
+uint32_t lanLostCount = 0, mqttLostCount = 0;
+unsigned long lastEthCheck = 0, lastDhcpTry = 0, lastHeartbeat = 0, lastDiag = 0;
+unsigned long mqttRetryDelay = MQTT_RETRY_MIN;
+unsigned long problemSince = 0;
+bool sudahResetEth = false;
+bool diagSegera = false;
+bool restartDiminta = false;
+
+// riwayat gangguan
+bool pernahOnline = false;
+unsigned long outageStart = 0, lastOutageSec = 0;
+NetState outageCause = NS_ONLINE, lastOutageCause = NS_ONLINE;
+
+// statistik HTTP
+int lastHttpCode = 0;
+uint32_t httpOkCount = 0, httpFailCount = 0;
+uint8_t httpFailStreak = 0;
+unsigned long lastHttpOkMs = 0;
+
+NetState hitungNetState()
+{
+  if (!linkUp)
+    return NS_KABEL_PUTUS;
+  if (!lanOK)
+    return NS_TANPA_IP;
+  if (!mqttOK)
+    return NS_MQTT_NG;
+  return NS_ONLINE;
+}
+
+const char *namaNetState(NetState ns)
+{
+  switch (ns)
+  {
+  case NS_KABEL_PUTUS:
+    return "KABEL_PUTUS";
+  case NS_TANPA_IP:
+    return "TANPA_IP";
+  case NS_MQTT_NG:
+    return "MQTT_NG";
+  default:
+    return "NONE";
+  }
+}
+
+const char *namaErrorMQTT(int k)
+{
+  switch (k)
+  {
+  case -4:
+    return "TIMEOUT";
+  case -3:
+    return "LOST";
+  case -2:
+    return "GAGAL";
+  case -1:
+    return "PUTUS";
+  case 0:
+    return "OK";
+  case 1:
+    return "PROTOK";
+  case 2:
+    return "CLIENT";
+  case 3:
+    return "BUSY";
+  case 4:
+    return "PASSWD";
+  case 5:
+    return "NOAKSES";
+  default:
+    return "???";
+  }
+}
+
+const char *namaResetReason()
+{
+  switch (esp_reset_reason())
+  {
+  case ESP_RST_POWERON:
+    return "POWER";
+  case ESP_RST_SW:
+    return "SOFTWARE";
+  case ESP_RST_PANIC:
+    return "PANIC";
+  case ESP_RST_INT_WDT:
+  case ESP_RST_TASK_WDT:
+  case ESP_RST_WDT:
+    return "WATCHDOG";
+  case ESP_RST_BROWNOUT:
+    return "BROWNOUT";
+  default:
+    return "LAINNYA";
+  }
+}
+
+bool statusIdle()
+{
+  return currentState == STATE_FETCH_API || currentState == STATE_PILIH_DATA;
+}
+
+bool adaIP() { return (uint32_t)Ethernet.localIP() != 0; }
+
+void publishIP()
+{
+  IPAddress ip = Ethernet.localIP();
+  char b[20];
+  snprintf(b, sizeof(b), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  client.publish(topicHmiIP, b, true);
+}
+
+void publishDiag()
+{
+  if (!client.connected())
+    return;
+  IPAddress ip = Ethernet.localIP();
+  long httpAgo = (lastHttpOkMs == 0) ? -1 : (long)((millis() - lastHttpOkMs) / 1000UL);
+
+  char buf[480];
+  snprintf(buf, sizeof(buf),
+           "{\"last_outage_s\":%lu,\"last_outage_cause\":\"%s\","
+           "\"last_err\":%d,\"last_err_name\":\"%s\","
+           "\"lan_lost\":%lu,\"mqtt_lost\":%lu,"
+           "\"http_code\":%d,\"http_ok\":%lu,\"http_fail\":%lu,"
+           "\"http_streak\":%u,\"http_ok_ago_s\":%ld,"
+           "\"sensor\":\"%s\",\"state\":%d,"
+           "\"reset\":\"%s\",\"up_min\":%lu,\"heap\":%lu,"
+           "\"ip\":\"%u.%u.%u.%u\",\"fw\":\"%s\"}",
+           lastOutageSec, namaNetState(lastOutageCause),
+           lastErrSeen, namaErrorMQTT(lastErrSeen),
+           (unsigned long)lanLostCount, (unsigned long)mqttLostCount,
+           lastHttpCode, (unsigned long)httpOkCount, (unsigned long)httpFailCount,
+           (unsigned)httpFailStreak, httpAgo,
+           sensorMode.c_str(), (int)currentState,
+           namaResetReason(), millis() / 60000UL, (unsigned long)ESP.getFreeHeap(),
+           ip[0], ip[1], ip[2], ip[3], FW_VERSION);
+  client.publish(topicHmiDiag, buf, true);
+}
+
+void restartDevice(const char *alasan)
+{
+  Serial.println(String("RESTART ESP32, alasan: ") + alasan);
+  if (client.connected())
+  {
+    client.publish(topicHmiStatus, "0", true);
+    client.disconnect();
+  }
+  delay(300);
+  ESP.restart();
+}
+
+void aktifkanWatchdog()
+{
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t cfg = {
+      .timeout_ms = WDT_TIMEOUT_S * 1000,
+      .idle_core_mask = 0,
+      .trigger_panic = true};
+  if (esp_task_wdt_reconfigure(&cfg) != ESP_OK)
+    esp_task_wdt_init(&cfg);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+  esp_task_wdt_add(NULL); // task loop() ikut diawasi
+}
+
+void resetEthernet()
+{
+  Serial.println("RESET MODUL ETHERNET (W5500)...");
+  ethClient.stop();
+  httpClient.stop();
+  Ethernet.init(ETHERNET_CS_PIN);
+  lanOK = (Ethernet.begin(mac, 8000, 2000) != 0);
+}
+
+void cekEthernet()
+{
+  if (Ethernet.linkStatus() == LinkOFF)
+  {
+    if (linkOffSamples < 255)
+      linkOffSamples++;
+    if (linkOffSamples >= LINK_OFF_CONFIRM)
+    {
+      if (linkUp)
+      {
+        lanLostCount++;
+        Serial.println("KABEL LAN PUTUS");
+      }
+      linkUp = false;
+      lanOK = false;
+    }
+    return;
+  }
+
+  linkOffSamples = 0;
+  linkUp = true;
+
+  if (!adaIP())
+  {
+    lanOK = false;
+    unsigned long now = millis();
+    if (now - lastDhcpTry >= DHCP_RETRY_INTERVAL)
+    {
+      lastDhcpTry = now;
+      if (Ethernet.begin(mac, 8000, 2000) != 0)
+        lanOK = true;
+    }
+    return;
+  }
+
+  Ethernet.maintain(); // perpanjang sewa DHCP
+  lanOK = true;
+}
+
+// Dipanggil setiap putaran loop()
+void pantauJaringan()
+{
+  static bool prevMqttOK = false;
+  unsigned long now = millis();
+
+  if (now - lastEthCheck >= ETH_CHECK_INTERVAL)
+  {
+    lastEthCheck = now;
+    cekEthernet();
+  }
+
+  mqttOK = client.connected();
+  if (prevMqttOK && !mqttOK)
+  {
+    mqttLostCount++;
+    Serial.println("MQTT PUTUS");
+  }
+  prevMqttOK = mqttOK;
+
+  // riwayat gangguan
+  NetState ns = hitungNetState();
+  if (ns == NS_ONLINE)
+  {
+    if (outageStart != 0)
+    {
+      lastOutageSec = (now - outageStart) / 1000UL;
+      lastOutageCause = outageCause;
+      outageStart = 0;
+      diagSegera = true;
+    }
+    pernahOnline = true;
+  }
+  else if (pernahOnline)
+  {
+    if (outageStart == 0)
+    {
+      outageStart = now;
+      outageCause = ns;
+    }
+    else if (ns < outageCause)
+      outageCause = ns;
+  }
+
+  // heartbeat & diag
+  if (client.connected())
+  {
+    if (now - lastHeartbeat >= HEARTBEAT_INTERVAL)
+    {
+      lastHeartbeat = now;
+      client.publish(topicHmiStatus, "1", true);
+    }
+    if (diagSegera || now - lastDiag >= DIAG_INTERVAL)
+    {
+      lastDiag = now;
+      diagSegera = false;
+      publishDiag();
+    }
+  }
+
+  // pemulihan bertingkat (hanya jika kabel ada tapi MQTT belum OK)
+  bool bermasalah = linkUp && !mqttOK;
+  if (!bermasalah)
+  {
+    problemSince = 0;
+    sudahResetEth = false;
+  }
+  else if (problemSince == 0)
+    problemSince = now;
+  else
+  {
+    unsigned long lama = now - problemSince;
+    if (!sudahResetEth && lama > RESET_ETH_AFTER)
+    {
+      sudahResetEth = true;
+      resetEthernet(); // langkah 1: reset chip W5500
+    }
+    else if (lama > RESTART_AFTER && statusIdle())
+    {
+      restartDevice("MQTT bermasalah > 10 menit"); // langkah 2, hanya saat idle
+    }
+  }
+
+  if (restartDiminta && statusIdle())
+    restartDevice("perintah MQTT");
+}
+
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
   String message = "";
@@ -222,26 +570,53 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   {
     sensorMode = message;
   }
+  else if (t == topicHmiPerintah)
+  {
+    message.trim();
+    if (message == "RESTART_DEVICE")
+      restartDiminta = true; // dieksekusi di pantauJaringan() saat HMI idle
+  }
 }
 
 bool mqttTryConnect()
 {
-  String clientId = "ESP32Sanding-" + String(random(0xffff), HEX);
-  if (client.connect(clientId.c_str()))
+  ethClient.stop(); // bebaskan socket lama
+  String clientId = "ESP32Sanding-" + macString();
+
+  // Last Will: jika HMI putus mendadak, broker menulis "0" ke topik status
+  if (client.connect(clientId.c_str(), topicHmiStatus, 0, true, "0"))
   {
+    mqttOK = true;
+    mqttErr = 0;
+    mqttRetryDelay = MQTT_RETRY_MIN;
+
     client.subscribe(topicMasuk);
     client.subscribe(topicKeluar);
     client.subscribe(topicRefresh);
     client.subscribe(topicAck);
     client.subscribe(topicMode);
+    client.subscribe(topicHmiPerintah);
+
+    client.publish(topicHmiStatus, "1", true);
+    publishIP();
+    diagSegera = true;
+    lastHeartbeat = millis();
     return true;
   }
+
+  mqttErr = client.state();
+  if (mqttErr != 0)
+    lastErrSeen = mqttErr;
+  mqttRetryDelay = min(mqttRetryDelay * 2, MQTT_RETRY_MAX);
+  mqttOK = false;
   return false;
 }
 
 void reconnectMQTT()
 {
-  if (millis() - lastMqttAttempt < 5000)
+  if (!lanOK)
+    return; // tanpa jaringan, percuma mencoba
+  if (millis() - lastMqttAttempt < mqttRetryDelay)
     return;
   lastMqttAttempt = millis();
   mqttTryConnect();
@@ -455,11 +830,344 @@ void siapkanAlamatServer()
 }
 
 // =====================================================
+//  KUNCI (disimpan di NVS, TIDAK ada di firmware)
+//  Isi lewat Serial Monitor:
+//    setkey <API key sanding>
+//    setotakey <key dari: php artisan device:key MAC>
+// =====================================================
+Preferences prefs;
+String apiKeyRuntime = "";
+String otaKeyRuntime = "";
+
+void muatKunci()
+{
+  prefs.begin("cfg", false);
+  apiKeyRuntime = prefs.getString("apikey", "");
+  otaKeyRuntime = prefs.getString("otakey", "");
+  prefs.end();
+  if (apiKeyRuntime.length() == 0)
+    Serial.println("[CFG] apikey belum diset. Ketik: setkey <KEY>");
+  if (otaKeyRuntime.length() == 0)
+    Serial.println("[CFG] otakey belum diset. Ketik: setotakey <KEY>");
+}
+
+void cekPerintahSerial()
+{
+  if (!Serial.available())
+    return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+
+  if (line.startsWith("setkey "))
+  {
+    apiKeyRuntime = line.substring(7);
+    apiKeyRuntime.trim();
+    prefs.begin("cfg", false);
+    prefs.putString("apikey", apiKeyRuntime);
+    prefs.end();
+    Serial.println("[CFG] apikey tersimpan.");
+  }
+  else if (line.startsWith("setotakey "))
+  {
+    otaKeyRuntime = line.substring(10);
+    otaKeyRuntime.trim();
+    prefs.begin("cfg", false);
+    prefs.putString("otakey", otaKeyRuntime);
+    prefs.end();
+    Serial.println("[CFG] otakey tersimpan.");
+  }
+}
+
+// =====================================================
+//  OTA
+// =====================================================
+const unsigned long OTA_CEK_PERTAMA_MS = 30000UL;   // 30 detik setelah boot
+const unsigned long OTA_CEK_INTERVAL_MS = 600000UL; // lalu tiap 10 menit
+const unsigned long OTA_IDLE_MIN_MS = 10000UL;      // jangan ganggu operator
+unsigned long otaBerikutnyaMs = OTA_CEK_PERTAMA_MS;
+
+String hexDari(const uint8_t *d, size_t n)
+{
+  static const char *h = "0123456789abcdef";
+  String s;
+  s.reserve(n * 2);
+  for (size_t i = 0; i < n; i++)
+  {
+    s += h[d[i] >> 4];
+    s += h[d[i] & 0x0F];
+  }
+  return s;
+}
+
+bool laporOta(const String &versi, const char *status, const String &pesan)
+{
+  JsonDocument doc;
+  doc["mac"] = macString();
+  doc["version"] = versi;
+  doc["status"] = status;
+  doc["message"] = pesan.substring(0, 200);
+  String body;
+  serializeJson(doc, body);
+
+  HttpHasil r = httpRequest("POST", "/api/device/firmware/report", body, "X-Device-Key", otaKeyRuntime);
+  Serial.println("[OTA] lapor " + String(status) + " -> HTTP " + String(r.status));
+  return r.status >= 200 && r.status < 300;
+}
+
+// Dipanggil sekali setelah boot: lapor hasil update yang tertunda
+void laporHasilBoot()
+{
+  prefs.begin("cfg", false);
+  String pending = prefs.getString("pending", "");
+  prefs.end();
+  if (pending.length() == 0 || otaKeyRuntime.length() == 0)
+    return;
+
+  bool sukses = (pending == String(FW_VERSION));
+  String pesan = sukses ? String("") : (String("Boot dengan versi ") + FW_VERSION);
+
+  if (laporOta(pending, sukses ? "success" : "failed", pesan))
+  {
+    prefs.begin("cfg", false);
+    prefs.remove("pending");
+    prefs.end();
+  }
+}
+
+// Unduh dari Laravel, tulis ke flash, hitung SHA-256 selama unduh
+bool unduhDanPasang(const String &versi, const String &checksumHex, String &alasan)
+{
+  if (Ethernet.linkStatus() == LinkOFF)
+  {
+    alasan = "Kabel LAN lepas";
+    return false;
+  }
+
+  EthernetClient dl; // koneksi terpisah dari MQTT dan HTTP biasa
+  if (!dl.connect(serverAddr, serverPortNum))
+  {
+    alasan = "Gagal konek server";
+    return false;
+  }
+
+  dl.println("GET /api/device/firmware/download?mac=" + macString() + "&device=" + DEVICE_TYPE + "&version=" + versi + " HTTP/1.0");
+  dl.println("Host: " + String(serverIp));
+  dl.println("X-Device-Key: " + otaKeyRuntime);
+  dl.println("Connection: close");
+  dl.println();
+
+  unsigned long mulai = millis();
+  while (dl.connected() && !dl.available())
+  {
+    if (millis() - mulai > 10000)
+    {
+      dl.stop();
+      alasan = "Server tidak menjawab";
+      return false;
+    }
+    delay(10);
+  }
+
+  String statusLine = dl.readStringUntil('\n');
+  int spasi = statusLine.indexOf(' ');
+  int kode = (spasi < 0) ? 0 : statusLine.substring(spasi + 1, spasi + 4).toInt();
+  if (kode != 200)
+  {
+    dl.stop();
+    alasan = "Download HTTP " + String(kode);
+    return false;
+  }
+
+  long panjang = -1;
+  while (dl.connected() || dl.available())
+  {
+    String line = dl.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0)
+      break;
+    line.toLowerCase();
+    if (line.startsWith("content-length:"))
+      panjang = line.substring(15).toInt();
+  }
+
+  if (panjang <= 0)
+  {
+    dl.stop();
+    alasan = "Content-Length tidak valid";
+    return false;
+  }
+  if (!Update.begin(panjang))
+  {
+    dl.stop();
+    alasan = String("Update.begin: ") + Update.errorString();
+    return false;
+  }
+
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts(&sha, 0);
+
+  uint8_t buf[1024];
+  long diterima = 0;
+  int persenTerakhir = -1;
+  bool gagal = false;
+  unsigned long terakhir = millis();
+
+  while (diterima < panjang)
+  {
+    int tersedia = dl.available();
+    if (tersedia > 0)
+    {
+      long sisa = panjang - diterima;
+      int minta = tersedia;
+      if (minta > (int)sizeof(buf))
+        minta = sizeof(buf);
+      if (minta > sisa)
+        minta = (int)sisa;
+
+      int n = dl.read(buf, minta);
+      if (n <= 0)
+        continue;
+
+      if (Update.write(buf, n) != (size_t)n)
+      {
+        alasan = String("Tulis flash: ") + Update.errorString();
+        gagal = true;
+        break;
+      }
+      mbedtls_sha256_update(&sha, buf, n);
+      diterima += n;
+      terakhir = millis();
+
+      int persen = (int)((diterima * 100L) / panjang);
+      if (persen != persenTerakhir && persen % 5 == 0)
+      {
+        persenTerakhir = persen;
+        lcd.setCursor(0, 2);
+        lcd.print("Unduh: " + String(persen) + "%    ");
+      }
+    }
+    else
+    {
+      if (!dl.connected() || millis() - terakhir > 15000)
+        break;
+      delay(1);
+    }
+  }
+
+  uint8_t digest[32];
+  mbedtls_sha256_finish(&sha, digest);
+  mbedtls_sha256_free(&sha);
+  dl.stop();
+
+  if (gagal)
+  {
+    Update.abort();
+    return false;
+  }
+  if (diterima != panjang)
+  {
+    Update.abort();
+    alasan = "Unduhan tidak lengkap";
+    return false;
+  }
+  if (!hexDari(digest, 32).equalsIgnoreCase(checksumHex))
+  {
+    Update.abort();
+    alasan = "Checksum tidak cocok";
+    return false;
+  }
+  if (!Update.end(true))
+  {
+    alasan = String("Update.end: ") + Update.errorString();
+    return false;
+  }
+
+  return true;
+}
+
+void cekUpdateFirmware()
+{
+  if (otaKeyRuntime.length() == 0)
+  {
+    Serial.println("[OTA] otakey belum diset, dilewati");
+    return;
+  }
+
+  String path = "/api/device/firmware/latest?mac=" + macString() +
+                "&device=" + DEVICE_TYPE + "&current_version=" + FW_VERSION;
+  HttpHasil r = httpRequest("GET", path, "", "X-Device-Key", otaKeyRuntime);
+
+  if (r.status != 200)
+  {
+    Serial.println("[OTA] cek gagal, HTTP " + String(r.status));
+    return;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, r.body) || !doc["update_available"].as<bool>())
+    return;
+
+  String versi = doc["latest"]["version"].as<String>();
+  String checksum = doc["latest"]["checksum"].as<String>();
+  if (versi.length() == 0 || checksum.length() != 64)
+    return;
+
+  Serial.println("[OTA] versi baru: " + versi);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("UPDATE FIRMWARE");
+  lcd.setCursor(0, 1);
+  lcd.print(versi);
+  lcd.setCursor(0, 3);
+  lcd.print("Jangan matikan alat!");
+
+  String alasan;
+  if (unduhDanPasang(versi, checksum, alasan))
+  {
+    prefs.begin("cfg", false);
+    prefs.putString("pending", versi); // dilaporkan setelah boot
+    prefs.end();
+    lcd.setCursor(0, 2);
+    lcd.print("Selesai, restart... ");
+    delay(1500);
+    ESP.restart();
+  }
+
+  Serial.println("[OTA] GAGAL: " + alasan);
+  laporOta(versi, "failed", alasan);
+  lcd.setCursor(0, 2);
+  lcd.print("Update gagal        ");
+  delay(2500);
+
+  // Kembalikan tampilan layar sebelumnya
+  lastModal = -1;
+  if (currentState == STATE_PILIH_DATA)
+    updateDisplayPilihData();
+  else
+    layarKosongTergambar = false;
+}
+
+void cekOtaBerkala()
+{
+  // Hanya saat idle. TIDAK PERNAH saat sanding berjalan
+  if (currentState != STATE_FETCH_API && currentState != STATE_PILIH_DATA)
+    return;
+  if ((long)(millis() - otaBerikutnyaMs) < 0)
+    return;
+  if (millis() - lastInteractionMs < OTA_IDLE_MIN_MS)
+    return;
+
+  otaBerikutnyaMs = millis() + OTA_CEK_INTERVAL_MS;
+  cekUpdateFirmware();
+}
+
+// =====================================================
 //  SETUP & LOOP
 // =====================================================
 void setup()
 {
   Serial.begin(115200);
+  muatKunci();
   Serial.println("\n--- HMI SANDING IOT (ETHERNET W5500 + NEW PINS) ---");
 
   pinMode(PIN_CLK, INPUT_PULLUP);
@@ -493,12 +1201,20 @@ void setup()
   lcd.print(Ethernet.localIP().toString());
   delay(2000);
 
+  linkUp = (Ethernet.linkStatus() != LinkOFF);
+  lanOK = adaIP();
+
   client.setServer(mqttServer, mqttPort);
   client.setCallback(mqttCallback);
+  client.setBufferSize(640); // default 256 byte tidak cukup untuk JSON diag
+  client.setKeepAlive(15);
+  client.setSocketTimeout(3); // koneksi gagal tidak menahan UI lama
   mqttTryConnect();
   lastMqttAttempt = millis();
+  aktifkanWatchdog();
 
   siapkanAlamatServer(); // [TAHAP 1] pecah IP:port sekali saja
+  laporHasilBoot();
   lastStateCLK = digitalRead(PIN_CLK);
   fetchDataFromAPI(false);
   lastPollMs = millis();
@@ -506,6 +1222,8 @@ void setup()
 
 void loop()
 {
+  esp_task_wdt_reset();
+  cekPerintahSerial();
   if (!client.connected())
   {
     reconnectMQTT();
@@ -514,6 +1232,8 @@ void loop()
   {
     client.loop();
   }
+  pantauJaringan();
+  cekOtaBerkala();
 
   switch (currentState)
   {
@@ -549,60 +1269,63 @@ void loop()
 //  Mengembalikan status code HTTP asli + body balasan.
 //  Kode negatif = error buatan kita (-1, -100, -101).
 // =====================================================
-HttpHasil httpRequest(const char *method, const String &path, const String &body)
+
+HttpHasil httpRequest(const char *method, const String &path, const String &body,
+                      const char *namaHeader, const String &nilaiHeader)
 {
   HttpHasil hasil = {0, ""};
 
-  // 1. Cek kabel LAN
   if (Ethernet.linkStatus() == LinkOFF)
   {
     hasil.status = ERR_ETH_PUTUS;
     return hasil;
   }
 
-  // 2. Konek ke server
-  if (!ethClient.connect(serverAddr, serverPortNum))
+  if (!httpClient.connect(serverAddr, serverPortNum))
   {
     hasil.status = -1;
     return hasil;
   }
 
-  // 3. Kirim request. println() = akhiri baris dengan \r\n (aturan HTTP)
-  ethClient.println(String(method) + " " + path + " HTTP/1.0");
-  ethClient.println("Host: " + String(serverIp));
-  ethClient.println("Accept: application/json");
-  // ethClient.println("X-API-KEY: " + String(apiKey)); // dinonaktifkan sementara
-  ethClient.println("Connection: close");
+  httpClient.println(String(method) + " " + path + " HTTP/1.0");
+  httpClient.println("Host: " + String(serverIp));
+  httpClient.println("Accept: application/json");
+  if (namaHeader != nullptr)
+  {
+    if (nilaiHeader.length() > 0)
+      httpClient.println(String(namaHeader) + ": " + nilaiHeader);
+  }
+  else if (apiKeyRuntime.length() > 0)
+  {
+    httpClient.println("X-API-KEY: " + apiKeyRuntime);
+  }
+  httpClient.println("Connection: close");
   if (body.length() > 0)
   {
-    ethClient.println("Content-Type: application/json");
-    ethClient.println("Content-Length: " + String(body.length()));
+    httpClient.println("Content-Type: application/json");
+    httpClient.println("Content-Length: " + String(body.length()));
   }
-  ethClient.println(); // baris kosong = akhir header
-
-  // Body pakai print(), BUKAN println(), supaya panjangnya pas
+  httpClient.println();
   if (body.length() > 0)
-    ethClient.print(body);
+    httpClient.print(body);
 
-  // 4. Tunggu server mulai menjawab (maks 5 detik)
   unsigned long mulai = millis();
-  while (ethClient.connected() && !ethClient.available())
+  while (httpClient.connected() && !httpClient.available())
   {
     if (millis() - mulai > 5000)
     {
-      ethClient.stop();
+      httpClient.stop();
       hasil.status = -1;
       return hasil;
     }
     delay(10);
   }
 
-  // 5. Baris pertama balasan, contoh: "HTTP/1.0 200 OK" -> ambil 200
-  String statusLine = ethClient.readStringUntil('\n');
+  String statusLine = httpClient.readStringUntil('\n');
   int spasi = statusLine.indexOf(' ');
   if (spasi < 0)
   {
-    ethClient.stop();
+    httpClient.stop();
     hasil.status = ERR_DATA_TIDAK_VALID;
     return hasil;
   }
@@ -610,27 +1333,25 @@ HttpHasil httpRequest(const char *method, const String &path, const String &body
   if (hasil.status == 0)
     hasil.status = ERR_DATA_TIDAK_VALID;
 
-  // 6. Lewati header sampai ketemu baris kosong
-  while (ethClient.connected() || ethClient.available())
+  while (httpClient.connected() || httpClient.available())
   {
-    String line = ethClient.readStringUntil('\n');
+    String line = httpClient.readStringUntil('\n');
     if (line == "\r" || line.length() == 0)
       break;
   }
 
-  // 7. Baca body selama koneksi hidup (batas diam 3 detik)
   unsigned long terakhir = millis();
-  while ((ethClient.connected() || ethClient.available()) && millis() - terakhir < 3000)
+  while ((httpClient.connected() || httpClient.available()) && millis() - terakhir < 3000)
   {
-    while (ethClient.available())
+    while (httpClient.available())
     {
-      hasil.body += (char)ethClient.read();
+      hasil.body += (char)httpClient.read();
       terakhir = millis();
     }
     delay(1);
   }
 
-  ethClient.stop();
+  httpClient.stop();
   return hasil;
 }
 
@@ -664,7 +1385,7 @@ bool fetchDataFromAPI(bool silent)
     return false; // data sama persis dengan sebelumnya, tidak ada yang berubah
   }
 
-  DynamicJsonDocument doc(8192);
+  JsonDocument doc;
   DeserializationError error = deserializeJson(doc, payload);
 
   if (error || !doc["data"].is<JsonArray>())
@@ -929,7 +1650,7 @@ void handleSandingRunning()
   // Status untuk tampilan: 0 = susut (tanpa label), 1 = anomali, 2 = tepat,
   // 3 = sensor tidak sedang menghitung (mis. sensor restart) -> data tidak valid
   int statusTampil = 0;
-  if (sensorMode != "ON")
+  if (!client.connected() || sensorMode != "ON")
     statusTampil = 3;
   else if (jenis == HASIL_ANOMALI)
     statusTampil = 1;
@@ -1178,7 +1899,7 @@ void kirimDataKeServer()
   if (putaranKe > MAX_PUTARAN_PER_SISI)
     putaranKe = MAX_PUTARAN_PER_SISI;
 
-  DynamicJsonDocument doc(512);
+  JsonDocument doc;
   doc["sisi"] = sisiFace ? "face" : "back";
   doc["putaran_ke"] = putaranKe;
   doc["modal"] = masterModal[indexData];
