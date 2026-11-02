@@ -8,4 +8,4 @@
 static const char *mqttServer = "103.27.206.23";
 static const int mqttPort = 1883;
 static const char *serverIp = "192.168.1.24:3000"; // Ini bisa diganti menjadi nama domain, misal "sanding.example.com:8000"
-static const char *sandingType = "...";
+static const char *sandingType = "besar";

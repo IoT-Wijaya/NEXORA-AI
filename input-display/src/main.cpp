@@ -133,6 +133,23 @@ void updateDisplayKonfirmasi();
 // Alamat server dipecah SEKALI di setup, tidak diulang-ulang
 IPAddress serverAddr;
 int serverPortNum = 80;
+String serverHostRuntime = ""; // IP Laravel, boleh disertai :port
+// EthernetServer asli tidak memenuhi kontrak Server::begin(uint16_t) milik
+// core ESP32, jadi dianggap abstract. Class ini menambal kekurangan itu.
+class ConfigServer : public EthernetServer
+{
+public:
+  ConfigServer(uint16_t port) : EthernetServer(port) {}
+
+  // Memenuhi kontrak core ESP32, lalu meneruskan ke begin() milik library.
+  void begin(uint16_t port = 0) override
+  {
+    (void)port; // port sudah ditentukan lewat konstruktor
+    EthernetServer::begin();
+  }
+};
+
+ConfigServer configServer(8080); // halaman konfigurasi lokal ESP32 // halaman konfigurasi lokal ESP32
 
 // =====================================================
 //  DATA MASTER DARI API
@@ -822,11 +839,29 @@ int putaranSisiTerpilih()
 // =====================================================
 void siapkanAlamatServer()
 {
-  String s = String(serverIp);
+  if (serverHostRuntime.length() == 0)
+    serverHostRuntime = String(serverIp); // nilai awal dari config.h
+
+  String s = serverHostRuntime;
   int titikDua = s.indexOf(':');
   String ipOnly = (titikDua >= 0) ? s.substring(0, titikDua) : s;
-  serverPortNum = (titikDua >= 0) ? s.substring(titikDua + 1).toInt() : 80;
-  serverAddr.fromString(ipOnly);
+  int port = (titikDua >= 0) ? s.substring(titikDua + 1).toInt() : 80;
+
+  if (port < 1 || port > 65535)
+    port = 80;
+  serverPortNum = port;
+  if (!serverAddr.fromString(ipOnly))
+  {
+    Serial.println("[CFG] IP server tidak valid: " + ipOnly);
+    String fallback = String(serverIp);
+    int fallbackColon = fallback.indexOf(':');
+    String fallbackIp = (fallbackColon >= 0) ? fallback.substring(0, fallbackColon) : fallback;
+    int fallbackPort = (fallbackColon >= 0) ? fallback.substring(fallbackColon + 1).toInt() : 80;
+    serverHostRuntime = fallback;
+    serverAddr.fromString(fallbackIp);
+    serverPortNum = (fallbackPort >= 1 && fallbackPort <= 65535) ? fallbackPort : 80;
+  }
+  Serial.println("[CFG] Server Laravel: " + serverHostRuntime);
 }
 
 // =====================================================
@@ -844,6 +879,7 @@ void muatKunci()
   prefs.begin("cfg", false);
   apiKeyRuntime = prefs.getString("apikey", "");
   otaKeyRuntime = prefs.getString("otakey", "");
+  serverHostRuntime = prefs.getString("server", String(serverIp));
   prefs.end();
   if (apiKeyRuntime.length() == 0)
     Serial.println("[CFG] apikey belum diset. Ketik: setkey <KEY>");
@@ -876,6 +912,167 @@ void cekPerintahSerial()
     prefs.end();
     Serial.println("[CFG] otakey tersimpan.");
   }
+}
+
+// =====================================================
+//  KONFIGURASI MELALUI BROWSER (LAN PORT 8080)
+//  Buka: http://IP-ESP32:8080
+//  Server Laravel memakai format IPv4 atau IPv4:PORT.
+// =====================================================
+String decodeFormValue(const String &v)
+{
+  String out;
+  out.reserve(v.length());
+  for (size_t i = 0; i < v.length(); i++)
+  {
+    if (v[i] == '+')
+      out += ' ';
+    else if (v[i] == '%' && i + 2 < v.length())
+    {
+      char hex[3] = {v[i + 1], v[i + 2], 0};
+      out += (char)strtol(hex, nullptr, 16);
+      i += 2;
+    }
+    else
+      out += v[i];
+  }
+  return out;
+}
+
+String ambilForm(const String &body, const String &nama)
+{
+  String cari = nama + "=";
+  int mulai = body.indexOf(cari);
+  if (mulai < 0)
+    return "";
+  mulai += cari.length();
+  int akhir = body.indexOf('&', mulai);
+  if (akhir < 0)
+    akhir = body.length();
+  return decodeFormValue(body.substring(mulai, akhir));
+}
+
+void kirimHalamanKonfigurasi(EthernetClient &c, const String &pesan = "")
+{
+  String html = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<meta charset='utf-8'><title>Konfigurasi HMI</title>"
+                "<style>body{font-family:Arial;max-width:520px;margin:24px auto;padding:0 14px;background:#f4f5f7}"
+                ".card{background:white;padding:20px;border-radius:12px}input{box-sizing:border-box;width:100%;padding:12px;margin:7px 0 15px}"
+                "button{padding:12px 18px;background:#1769aa;color:white;border:0;border-radius:7px}small{color:#555}</style></head><body><div class='card'>"
+                "<h2>Konfigurasi HMI Sanding</h2>";
+  if (pesan.length())
+    html += "<p><b>" + pesan + "</b></p>";
+  html += "<form method='POST' action='/save'>"
+          "<label>IP Laravel (contoh 192.168.1.10:8000)</label>"
+          "<input name='server' required value='" +
+          serverHostRuntime + "'>"
+                              "<label>API Key Laravel</label><input name='apikey' type='password' placeholder='Kosongkan jika tidak diubah'>"
+                              "<label>OTA Device Key</label><input name='otakey' type='password' placeholder='Kosongkan jika tidak diubah'>"
+                              "<button type='submit'>Simpan Konfigurasi</button></form>"
+                              "<small>API Key dan OTA Key tidak ditampilkan kembali. Perangkat akan memakai nilai yang tersimpan setelah konfigurasi disimpan.</small>"
+                              "<p>IP ESP32: " +
+          Ethernet.localIP().toString() + "</p></div></body></html>";
+  c.println("HTTP/1.1 200 OK");
+  c.println("Content-Type: text/html; charset=utf-8");
+  c.println("Connection: close");
+  c.println("Content-Length: " + String(html.length()));
+  c.println();
+  c.print(html);
+}
+
+void prosesWebKonfigurasi()
+{
+  EthernetClient web = configServer.available();
+  if (!web)
+    return;
+
+  unsigned long mulai = millis();
+  while (!web.available() && millis() - mulai < 1500)
+    delay(1);
+  if (!web.available())
+  {
+    web.stop();
+    return;
+  }
+
+  String requestLine = web.readStringUntil('\n');
+  requestLine.trim();
+  bool isPost = requestLine.startsWith("POST ");
+  int contentLength = 0;
+  while (web.connected())
+  {
+    String h = web.readStringUntil('\n');
+    if (h == "\r" || h.length() == 0)
+      break;
+    h.trim();
+    String lower = h;
+    lower.toLowerCase();
+    if (lower.startsWith("content-length:"))
+      contentLength = lower.substring(15).toInt();
+  }
+
+  String body;
+  if (isPost && contentLength > 0 && contentLength < 2048)
+  {
+    mulai = millis();
+    while ((int)body.length() < contentLength && millis() - mulai < 3000)
+    {
+      while (web.available() && (int)body.length() < contentLength)
+        body += (char)web.read();
+      delay(1);
+    }
+  }
+
+  if (!isPost)
+  {
+    kirimHalamanKonfigurasi(web);
+  }
+  else if (requestLine.startsWith("POST /save ") && (int)body.length() == contentLength)
+  {
+    String host = ambilForm(body, "server");
+    String api = ambilForm(body, "apikey");
+    String ota = ambilForm(body, "otakey");
+    host.trim();
+    api.trim();
+    ota.trim();
+
+    int colon = host.indexOf(':');
+    String ipText = (colon >= 0) ? host.substring(0, colon) : host;
+    int port = (colon >= 0) ? host.substring(colon + 1).toInt() : 80;
+    IPAddress testIP;
+    bool valid = testIP.fromString(ipText) && port >= 1 && port <= 65535;
+
+    if (!valid)
+    {
+      kirimHalamanKonfigurasi(web, "Format IP/port tidak valid. Gunakan IPv4 atau IPv4:PORT.");
+    }
+    else
+    {
+      prefs.begin("cfg", false);
+      prefs.putString("server", host);
+      if (api.length())
+        prefs.putString("apikey", api);
+      if (ota.length())
+        prefs.putString("otakey", ota);
+      prefs.end();
+
+      serverHostRuntime = host;
+      if (api.length())
+        apiKeyRuntime = api;
+      if (ota.length())
+        otaKeyRuntime = ota;
+      siapkanAlamatServer();
+      kirimHalamanKonfigurasi(web, "Konfigurasi berhasil disimpan.");
+      Serial.println("[CFG] Konfigurasi browser disimpan (nilai kunci tidak ditampilkan).");
+    }
+  }
+  else
+  {
+    web.println("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nRequest tidak valid");
+  }
+
+  delay(2);
+  web.stop();
 }
 
 // =====================================================
@@ -951,7 +1148,7 @@ bool unduhDanPasang(const String &versi, const String &checksumHex, String &alas
   }
 
   dl.println("GET /api/device/firmware/download?mac=" + macString() + "&device=" + DEVICE_TYPE + "&version=" + versi + " HTTP/1.0");
-  dl.println("Host: " + String(serverIp));
+  dl.println("Host: " + serverHostRuntime);
   dl.println("X-Device-Key: " + otaKeyRuntime);
   dl.println("Connection: close");
   dl.println();
@@ -1213,7 +1410,9 @@ void setup()
   lastMqttAttempt = millis();
   aktifkanWatchdog();
 
-  siapkanAlamatServer(); // [TAHAP 1] pecah IP:port sekali saja
+  siapkanAlamatServer(); // gunakan alamat server dari NVS atau config.h
+  configServer.begin();
+  Serial.println("[CFG] Halaman konfigurasi: http://" + Ethernet.localIP().toString() + ":8080");
   laporHasilBoot();
   lastStateCLK = digitalRead(PIN_CLK);
   fetchDataFromAPI(false);
@@ -1224,6 +1423,7 @@ void loop()
 {
   esp_task_wdt_reset();
   cekPerintahSerial();
+  prosesWebKonfigurasi();
   if (!client.connected())
   {
     reconnectMQTT();
@@ -1288,7 +1488,7 @@ HttpHasil httpRequest(const char *method, const String &path, const String &body
   }
 
   httpClient.println(String(method) + " " + path + " HTTP/1.0");
-  httpClient.println("Host: " + String(serverIp));
+  httpClient.println("Host: " + serverHostRuntime);
   httpClient.println("Accept: application/json");
   if (namaHeader != nullptr)
   {
