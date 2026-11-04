@@ -62,7 +62,11 @@ const char *topicJumlah2 = TOPIC_BASE "jumlah2"; // Modal
 const char *topicIP = TOPIC_BASE "ip";
 const char *topicPerintah = TOPIC_BASE "perintah";
 const char *topicDiag = TOPIC_BASE "diag"; // laporan diagnosa lengkap (JSON)
+const char *topicAck = TOPIC_BASE "ack";
+const char *topicMode = TOPIC_BASE "mode";
 
+volatile bool hitungAktif = false;
+volatile uint8_t cmdTertunda = 0;
 // Isi topik status (sama dengan kode lama)
 #define STATUS_ONLINE "1"
 #define STATUS_OFFLINE "0"
@@ -563,6 +567,10 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   {
     restartDevice("perintah MQTT");
   }
+  else if (strcmp(command, "START") == 0)
+    cmdTertunda = 1;
+  else if (strcmp(command, "STOP") == 0)
+    cmdTertunda = 2;
 }
 
 // =====================================================
@@ -604,6 +612,7 @@ bool connectMQTT()
     mqttRetryDelay = MQTT_RETRY_MIN; // berhasil: jeda dikembalikan ke awal
 
     client.subscribe(topicPerintah);
+    client.publish(topicMode, hitungAktif ? "ON" : "OFF", true);
     client.publish(topicStatus, STATUS_ONLINE, true);
 
     publishCounters();
@@ -816,13 +825,15 @@ void sensorTask(void *parameter)
 {
   Serial.println("Sensor Task START");
 
-  esp_task_wdt_add(NULL); // daftarkan task ini ke watchdog
+  esp_task_wdt_add(NULL);
 
   for (;;)
   {
-    esp_task_wdt_reset(); // "saya masih hidup"
+    esp_task_wdt_reset();
 
-    if (prosesSensor(sensorHasil))
+    // prosesSensor() selalu dipanggil agar filternya tetap jalan
+    bool hitH = prosesSensor(sensorHasil);
+    if (hitH && hitungAktif)
     {
       portENTER_CRITICAL(&counterMux);
       jumlahHasil++;
@@ -830,14 +841,14 @@ void sensorTask(void *parameter)
 
       counterDirty = true;
 
-      // Serial dipanggil DI LUAR critical section
       unsigned long hasil, modal;
       bacaCounter(hasil, modal);
       Serial.print("HASIL +1 = ");
       Serial.println(hasil);
     }
 
-    if (prosesSensor(sensorModal))
+    bool hitM = prosesSensor(sensorModal);
+    if (hitM && hitungAktif)
     {
       portENTER_CRITICAL(&counterMux);
       jumlahModal++;
@@ -969,6 +980,32 @@ void networkTask(void *parameter)
       lastDiag = now;
       diagSegera = false;
       publishDiag();
+    }
+
+    uint8_t c = cmdTertunda;
+    cmdTertunda = 0;
+
+    if (c == 1) // START
+    {
+      resetCounters(true, true);
+      hitungAktif = true;
+      if (client.connected())
+      {
+        publishCounters();
+        client.publish(topicMode, "ON", true);
+        client.publish(topicAck, "START_OK", false);
+      }
+    }
+    else if (c == 2) // STOP
+    {
+      hitungAktif = false;
+      resetCounters(true, true);
+      if (client.connected())
+      {
+        publishCounters();
+        client.publish(topicMode, "OFF", true);
+        client.publish(topicAck, "STOP_OK", false);
+      }
     }
 
     // -------------------------------------------------

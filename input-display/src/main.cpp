@@ -2,6 +2,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <SPI.h>
 #include <Ethernet.h>
+#include <EthernetUdp.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include "config.h"
@@ -10,13 +11,20 @@
 #include "mbedtls/sha256.h"
 #include "esp_task_wdt.h"
 #include "esp_system.h"
+#include <Dns.h>
+#include <SSLClient.h>
+#include <NTPClient.h>
+#include <ESP32Encoder.h>  // BARU: pembacaan encoder lewat hardware PCNT
+#include "trust_anchors.h" // dibuat dengan pycert_bearssl.py: array TAs dan konstanta TAs_NUM
 
-const char *topicMasuk = "pabrik/sanding/jumlah";
-const char *topicKeluar = "pabrik/sanding/jumlah2";
-const char *topicRefresh = "pabrik/sanding/refresh";
-const char *topicPerintah = "pabrik/sanding/perintah";
-const char *topicAck = "pabrik/sanding/ack";
-const char *topicMode = "pabrik/sanding/mode";
+volatile bool otaDiminta = false;
+
+const char *topicMasuk = "pabrik/veneer/jumlah";
+const char *topicKeluar = "pabrik/veneer/jumlah2";
+const char *topicRefresh = "pabrik/veneer/refresh";
+const char *topicPerintah = "pabrik/veneer/perintah";
+const char *topicAck = "pabrik/veneer/ack";
+const char *topicMode = "pabrik/veneer/mode";
 
 // =====================================================
 //  KONFIGURASI ETHERNET W5500 (SPI: SCK=18, MISO=23, MOSI=19, CS=16)
@@ -27,10 +35,14 @@ const int ETHERNET_CS_PIN = 16;
 
 // =====================================================
 //  PENGATURAN AUTO UPDATE
+//  Polling dijarangkan: MQTT topik "refresh" sudah memicu ambil data.
 // =====================================================
-const unsigned long POLL_PILIH_MS = 15000;
+const unsigned long POLL_PILIH_MS = 300000; // 5 menit (sebelumnya 2 menit)
 const unsigned long POLL_KOSONG_MS = 8000;
-const unsigned long IDLE_SEBELUM_POLL_MS = 2000;
+const unsigned long IDLE_SEBELUM_POLL_MS = 5000; // operator harus diam 5 dtk (sebelumnya 2 dtk)
+
+// Timeout satu request HTTPS (sebelumnya bawaan SSLClient 30 dtk)
+const unsigned int SSL_TIMEOUT_MS = 8000;
 
 const int MAX_PUTARAN_PER_SISI = 2;
 
@@ -39,7 +51,25 @@ const int ERR_DATA_TIDAK_VALID = -101;
 
 EthernetClient ethClient;
 PubSubClient client(ethClient);
-EthernetClient httpClient;
+
+// =====================================================
+//  HTTP / HTTPS
+//  - httpPlain : HTTP biasa (server berupa IP lokal)
+//  - httpSSL   : HTTPS lewat SSLClient (BearSSL) di atas httpBase
+//  PIN_ENTROPI harus pin analog yang TIDAK tersambung ke apa pun.
+// =====================================================
+const int PIN_ENTROPI = 34;
+
+EthernetClient httpPlain;
+EthernetClient httpBase;
+SSLClient httpSSL(httpBase, TAs, (size_t)TAs_NUM, PIN_ENTROPI);
+
+// Sinkronisasi waktu (NTP) untuk memeriksa masa berlaku sertifikat
+EthernetUDP ntpUdp;
+NTPClient ntp(ntpUdp, "pool.ntp.org", 0);
+unsigned long ntpEpoch = 0; // detik UNIX saat sinkron terakhir (0 = belum pernah)
+unsigned long ntpMs = 0;    // millis() saat sinkron terakhir
+unsigned long ntpCobaMs = 0;
 
 // =====================================================
 //  LCD I2C (20x4)
@@ -47,12 +77,29 @@ EthernetClient httpClient;
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 // =====================================================
-//  DEFINISI PIN HARDWARE (ENCODER DIPINDAH KE 32 & 35)
+//  DEFINISI PIN HARDWARE
 // =====================================================
-const int PIN_CLK = 32;     // Dipindah ke 32 (aman dari SPI 18)
-const int PIN_DT = 35;      // Dipindah ke 35 (aman dari SPI 19)
+const int PIN_CLK = 32;
+const int PIN_DT = 35;      // GPIO35 input-only, TIDAK punya pull-up internal: pasang 10k ke 3V3
 const int PIN_SW = 5;       // Rotary Encoder Button (OK)
 const int PIN_BTN_PIN4 = 4; // Tombol fisik tunggal (BACK)
+
+// =====================================================
+//  ENCODER (HARDWARE PCNT)
+//  Putaran dihitung perangkat keras, jadi tidak hilang walau loop() tertahan
+//  oleh HTTP/TLS/LCD. ambilLangkahEncoder() mengembalikan jumlah "klik"
+//  sejak pemanggilan terakhir (+ = searah jarum jam).
+// =====================================================
+ESP32Encoder enc;
+int64_t encTerakhir = 0;
+
+int ambilLangkahEncoder()
+{
+  int64_t pos = enc.getCount();
+  int64_t langkah = (pos - encTerakhir) / 2; // attachHalfQuad: 2 pulsa per klik
+  encTerakhir += langkah * 2;
+  return (int)langkah;
+}
 
 // =====================================================
 //  TIPE DATA
@@ -96,13 +143,22 @@ struct HttpHasil
 HttpHasil httpRequest(const char *method, const String &path, const String &body,
                       const char *namaHeader = nullptr, const String &nilaiHeader = "");
 
+HttpHasil httpRequestMentah(const char *method, const String &path, const String &body,
+                            const char *namaHeader, const String &nilaiHeader);
+void logMqttPercobaan(bool ok, int state, unsigned long durMs);
+void logMqttPutus(int state);
+void logMqttMasuk(const char *topic, const byte *p, unsigned int len);
+void logPerubahanNet();
+unsigned long backoffBerikutnya(unsigned long sekarang);
+bool mqttPublishAman(const char *topic, const char *payload, bool retain);
+bool perintahDiagnostik(const String &m);
+void perintahSerialDiagnostik(String line);
+
 // =====================================================
 //  PROTOTIPE FUNGSI
-//  PlatformIO tidak membuat prototipe otomatis seperti Arduino IDE,
-//  jadi fungsi yang dipanggil sebelum didefinisikan harus dideklarasikan di sini.
 // =====================================================
 ErrInfo infoError(int code);
-String macString(); // tambahkan
+String macString();
 void siapkanMac();
 void resetHitungan();
 bool fetchDataFromAPI(bool silent);
@@ -111,8 +167,6 @@ void selesaikanSesi();
 void publishIP();
 void publishDiag();
 void restartDevice(const char *alasan);
-HttpHasil httpRequestRaw(const char *method, const String &path, const String &body,
-                         const char *namaHeader, const String &nilaiHeader);
 
 void handleFetchApi();
 void handlePilihDataMenu();
@@ -131,9 +185,12 @@ void updateDisplayValidasi();
 void updateDisplayKonfirmasi();
 
 // Alamat server dipecah SEKALI di setup, tidak diulang-ulang
-IPAddress serverAddr;
+IPAddress serverAddr;   // hanya dipakai untuk HTTP biasa
+String serverHost = ""; // nama host tanpa skema dan tanpa port
 int serverPortNum = 80;
-String serverHostRuntime = ""; // IP Laravel, boleh disertai :port
+bool serverTls = false;        // true = HTTPS
+String serverHostRuntime = ""; // yang tersimpan di NVS: IP/domain, boleh disertai skema dan :port
+
 // EthernetServer asli tidak memenuhi kontrak Server::begin(uint16_t) milik
 // core ESP32, jadi dianggap abstract. Class ini menambal kekurangan itu.
 class ConfigServer : public EthernetServer
@@ -141,7 +198,6 @@ class ConfigServer : public EthernetServer
 public:
   ConfigServer(uint16_t port) : EthernetServer(port) {}
 
-  // Memenuhi kontrak core ESP32, lalu meneruskan ke begin() milik library.
   void begin(uint16_t port = 0) override
   {
     (void)port; // port sudah ditentukan lewat konstruktor
@@ -149,7 +205,7 @@ public:
   }
 };
 
-ConfigServer configServer(8080); // halaman konfigurasi lokal ESP32 // halaman konfigurasi lokal ESP32
+ConfigServer configServer(8080); // halaman konfigurasi lokal ESP32
 
 // =====================================================
 //  DATA MASTER DARI API
@@ -167,7 +223,7 @@ int totalDataMaster = 0;
 
 int indexData = 0;
 String selectedSisi = "FACE";
-int lastStateCLK;
+int lastStateCLK; // tidak dipakai lagi oleh aplikasi; masih dirujuk diagnostik.h
 
 // =====================================================
 //  ANGKA SENSOR vs ANGKA KERJA
@@ -222,7 +278,6 @@ String ackTerakhir = ""; // balasan terakhir dari sensor ("START_OK", "STOP_OK",
 String sensorMode = "";  // "ON" = sensor sedang menghitung, "OFF" = tidak menghitung
 
 // Pembatalan darurat di layar Sanding Running (BACK biasa terkunci).
-// Set IZINKAN_BATAL_TAHAN = false untuk mengunci BACK sepenuhnya.
 const bool IZINKAN_BATAL_TAHAN = true;
 const unsigned long TAHAN_BATAL_MS = 3000; // tahan BACK sekian ms untuk batal
 unsigned long backTahanMulai = 0;
@@ -235,6 +290,8 @@ const char *topicHmiStatus = TOPIC_HMI "status";
 const char *topicHmiIP = TOPIC_HMI "ip";
 const char *topicHmiDiag = TOPIC_HMI "diag";
 const char *topicHmiPerintah = TOPIC_HMI "perintah";
+const char *topicHmiOta = TOPIC_HMI "ota";
+bool otaManual = false;
 
 const unsigned long ETH_CHECK_INTERVAL = 3000UL;
 const unsigned long DHCP_RETRY_INTERVAL = 15000UL;
@@ -427,7 +484,9 @@ void resetEthernet()
 {
   Serial.println("RESET MODUL ETHERNET (W5500)...");
   ethClient.stop();
-  httpClient.stop();
+  httpSSL.stop();
+  httpBase.stop();
+  httpPlain.stop();
   Ethernet.init(ETHERNET_CS_PIN);
   lanOK = (Ethernet.begin(mac, 8000, 2000) != 0);
 }
@@ -444,6 +503,7 @@ void cekEthernet()
       {
         lanLostCount++;
         Serial.println("KABEL LAN PUTUS");
+        ethClient.stop(); // tutup socket lama supaya tidak menunggu timeout keepalive
       }
       linkUp = false;
       lanOK = false;
@@ -452,7 +512,14 @@ void cekEthernet()
   }
 
   linkOffSamples = 0;
+  bool baruTersambung = !linkUp;
   linkUp = true;
+  if (baruTersambung)
+  {
+    Serial.println("KABEL LAN TERSAMBUNG");
+    mqttRetryDelay = MQTT_RETRY_MIN; // langsung coba sambung MQTT lagi
+    lastMqttAttempt = 0;
+  }
 
   if (!adaIP())
   {
@@ -487,12 +554,13 @@ void pantauJaringan()
   if (prevMqttOK && !mqttOK)
   {
     mqttLostCount++;
-    Serial.println("MQTT PUTUS");
+    logMqttPutus(client.state());
   }
   prevMqttOK = mqttOK;
 
   // riwayat gangguan
   NetState ns = hitungNetState();
+  logPerubahanNet();
   if (ns == NS_ONLINE)
   {
     if (outageStart != 0)
@@ -521,7 +589,7 @@ void pantauJaringan()
     if (now - lastHeartbeat >= HEARTBEAT_INTERVAL)
     {
       lastHeartbeat = now;
-      client.publish(topicHmiStatus, "1", true);
+      mqttPublishAman(topicHmiStatus, "1", true);
     }
     if (diagSegera || now - lastDiag >= DIAG_INTERVAL)
     {
@@ -560,6 +628,8 @@ void pantauJaringan()
 
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
+  logMqttMasuk(topic, payload, length);
+
   String message = "";
   for (unsigned int i = 0; i < length; i++)
   {
@@ -592,40 +662,46 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     message.trim();
     if (message == "RESTART_DEVICE")
       restartDiminta = true; // dieksekusi di pantauJaringan() saat HMI idle
+    else if (message == "CEK_OTA")
+      otaDiminta = true; // hanya bendera, unduhan dijalankan di loop()
+    else
+      perintahDiagnostik(message); // HWTEST_ON/OFF, STATUS, MQTT_RECONNECT, DEBUG_n
   }
 }
 
 bool mqttTryConnect()
 {
-  ethClient.stop(); // bebaskan socket lama
+  ethClient.stop();
   String clientId = "ESP32Sanding-" + macString();
+  unsigned long t0 = millis();
+  bool ok = client.connect(clientId.c_str(), topicHmiStatus, 0, true, "0");
+  unsigned long dur = millis() - t0;
 
-  // Last Will: jika HMI putus mendadak, broker menulis "0" ke topik status
-  if (client.connect(clientId.c_str(), topicHmiStatus, 0, true, "0"))
+  if (ok)
   {
     mqttOK = true;
     mqttErr = 0;
     mqttRetryDelay = MQTT_RETRY_MIN;
-
     client.subscribe(topicMasuk);
     client.subscribe(topicKeluar);
     client.subscribe(topicRefresh);
     client.subscribe(topicAck);
     client.subscribe(topicMode);
     client.subscribe(topicHmiPerintah);
-
     client.publish(topicHmiStatus, "1", true);
     publishIP();
     diagSegera = true;
     lastHeartbeat = millis();
+    logMqttPercobaan(true, 0, dur);
     return true;
   }
 
   mqttErr = client.state();
   if (mqttErr != 0)
     lastErrSeen = mqttErr;
-  mqttRetryDelay = min(mqttRetryDelay * 2, MQTT_RETRY_MAX);
+  mqttRetryDelay = backoffBerikutnya(mqttRetryDelay);
   mqttOK = false;
+  logMqttPercobaan(false, mqttErr, dur);
   return false;
 }
 
@@ -641,9 +717,6 @@ void reconnectMQTT()
 
 // =====================================================
 //  PERINTAH KE SENSOR (dengan konfirmasi + ulang 3x)
-//  Return true jika sensor membalas persis ackDiharapkan.
-//  Pesan MQTT bisa hilang di jalan, jadi kita tidak percaya
-//  begitu saja: tunggu balasan, kalau tidak datang kirim ulang.
 // =====================================================
 bool kirimPerintahSensor(const char *perintah, const char *ackDiharapkan)
 {
@@ -666,6 +739,7 @@ bool kirimPerintahSensor(const char *perintah, const char *ackDiharapkan)
     unsigned long mulai = millis();
     while (millis() - mulai < 2000)
     {
+      esp_task_wdt_reset();
       client.loop(); // wajib, supaya balasan bisa diterima
       if (ackTerakhir == ackDiharapkan)
       {
@@ -708,6 +782,7 @@ void batalkanPutaran()
   // Tunggu tombol dilepas supaya tidak "tembus" ke layar berikutnya
   while (digitalRead(PIN_BTN_PIN4) == LOW)
   {
+    esp_task_wdt_reset();
     if (client.connected())
       client.loop();
     delay(10);
@@ -728,11 +803,16 @@ ErrInfo infoError(int code)
   switch (code)
   {
   case -1:
-    return {"Tdk bisa konek", "Cek IP/server/FW", "Koneksi ditolak."};
+    return {"Tdk bisa konek", "Cek server/TLS/NTP", "Koneksi gagal."};
   case ERR_ETH_PUTUS:
     return {"Kabel LAN lepas", "Cek koneksi W5500", "Ethernet terputus."};
   case ERR_DATA_TIDAK_VALID:
     return {"Data aneh", "Balasan bukan JSON", "Format salah."};
+  case 301:
+  case 302:
+  case 307:
+  case 308:
+    return {"Dialihkan server", "Pakai https:// di cfg", "Redirect."};
   case 401:
     return {"API key salah", "Cek X-API-KEY", "API key ditolak."};
   case 404:
@@ -781,7 +861,6 @@ JenisHasil klasifikasiHasil()
 void resetHitungan()
 {
   // sensorMasuk / sensorKeluar SENGAJA tidak di-nol-kan di sini.
-  // Sumber kebenarannya sensor; reset dilakukan lewat resetSensorRemote().
   jumlahMasuk = 0;
   jumlahKeluar = 0;
   alasanIndex = 0;
@@ -797,8 +876,7 @@ void siapkanMac()
   for (int i = 0; i < 6; i++)
     mac[i] = (chipId >> (8 * (5 - i))) & 0xFF;
 
-  // Bit 1 di byte pertama = "locally administered", dipakai untuk MAC buatan
-  // pada antarmuka W5500, supaya tidak bentrok dengan MAC WiFi chip yang sama.
+  // Bit 1 di byte pertama = "locally administered"
   mac[0] = (mac[0] | 0x02) & 0xFE;
 }
 
@@ -834,34 +912,159 @@ int putaranSisiTerpilih()
 }
 
 // =====================================================
-//  [TAHAP 1] PEMECAH ALAMAT SERVER
-//  "192.168.1.23:8000" -> serverAddr = 192.168.1.23, serverPortNum = 8000
+//  ALAMAT SERVER (HTTP / HTTPS)
+//  Format yang diterima:
+//    192.168.1.10:8000              -> HTTP
+//    server.contoh.com              -> HTTPS port 443
+//    https://server.contoh.com      -> HTTPS port 443
+//    https://server.contoh.com:8443 -> HTTPS port 8443
+//    http://server.contoh.com       -> HTTP port 80
 // =====================================================
-void siapkanAlamatServer()
+bool hostValid(const String &h)
+{
+  if (h.length() < 1 || h.length() > 100)
+    return false;
+  for (size_t i = 0; i < h.length(); i++)
+  {
+    char c = h[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '.' || c == '-'))
+      return false;
+  }
+  return true;
+}
+
+bool uraiAlamat(String s, String &host, int &port, bool &tls)
+{
+  s.trim();
+  bool adaSkema = false;
+  tls = false;
+  if (s.startsWith("https://"))
+  {
+    tls = true;
+    adaSkema = true;
+    s = s.substring(8);
+  }
+  else if (s.startsWith("http://"))
+  {
+    adaSkema = true;
+    s = s.substring(7);
+  }
+  int garis = s.indexOf('/');
+  if (garis >= 0)
+    s = s.substring(0, garis);
+
+  bool adaPort = false;
+  port = tls ? 443 : 80;
+  int dua = s.indexOf(':');
+  if (dua >= 0)
+  {
+    port = s.substring(dua + 1).toInt();
+    adaPort = true;
+    s = s.substring(0, dua);
+  }
+  host = s;
+
+  // Tanpa skema: domain -> HTTPS, IP -> HTTP
+  if (!adaSkema)
+  {
+    IPAddress uji;
+    if (adaPort)
+      tls = (port == 443);
+    else if (!uji.fromString(host))
+    {
+      tls = true;
+      port = 443;
+    }
+  }
+  return hostValid(host) && port >= 1 && port <= 65535;
+}
+
+bool resolveServer()
+{
+  if (!uraiAlamat(serverHostRuntime, serverHost, serverPortNum, serverTls))
+    return false;
+  if (serverTls)
+    return true; // SSLClient mencari IP sendiri lewat nama domain
+
+  if (serverAddr.fromString(serverHost))
+    return true;
+
+  DNSClient dns;
+  dns.begin(Ethernet.dnsServerIP());
+  IPAddress hasil;
+  if (dns.getHostByName(serverHost.c_str(), hasil) == 1)
+  {
+    serverAddr = hasil;
+    Serial.println("[CFG] " + serverHost + " -> " + hasil.toString());
+    return true;
+  }
+  Serial.println("[CFG] DNS gagal untuk " + serverHost);
+  return false;
+}
+
+// Header Host: port tidak ditulis jika port bawaan skema
+String hostHeader()
+{
+  bool bawaan = (serverTls && serverPortNum == 443) || (!serverTls && serverPortNum == 80);
+  return bawaan ? serverHost : serverHost + ":" + String(serverPortNum);
+}
+
+bool siapkanAlamatServer()
 {
   if (serverHostRuntime.length() == 0)
-    serverHostRuntime = String(serverIp); // nilai awal dari config.h
+    serverHostRuntime = String(serverIp);
 
-  String s = serverHostRuntime;
-  int titikDua = s.indexOf(':');
-  String ipOnly = (titikDua >= 0) ? s.substring(0, titikDua) : s;
-  int port = (titikDua >= 0) ? s.substring(titikDua + 1).toInt() : 80;
-
-  if (port < 1 || port > 65535)
-    port = 80;
-  serverPortNum = port;
-  if (!serverAddr.fromString(ipOnly))
+  bool ok = resolveServer();
+  if (!ok)
   {
-    Serial.println("[CFG] IP server tidak valid: " + ipOnly);
-    String fallback = String(serverIp);
-    int fallbackColon = fallback.indexOf(':');
-    String fallbackIp = (fallbackColon >= 0) ? fallback.substring(0, fallbackColon) : fallback;
-    int fallbackPort = (fallbackColon >= 0) ? fallback.substring(fallbackColon + 1).toInt() : 80;
-    serverHostRuntime = fallback;
-    serverAddr.fromString(fallbackIp);
-    serverPortNum = (fallbackPort >= 1 && fallbackPort <= 65535) ? fallbackPort : 80;
+    Serial.println("[CFG] Alamat server gagal, pakai cadangan config.h");
+    serverHostRuntime = String(serverIp);
+    resolveServer();
   }
-  Serial.println("[CFG] Server Laravel: " + serverHostRuntime);
+  Serial.println("[CFG] Server Laravel: " + serverHostRuntime + (serverTls ? " (HTTPS)" : " (HTTP)"));
+  return ok;
+}
+
+// =====================================================
+//  WAKTU (NTP) - dibutuhkan untuk memeriksa masa berlaku sertifikat
+// =====================================================
+void sinkronWaktu()
+{
+  ntp.begin();
+  if (ntp.forceUpdate())
+  {
+    ntpEpoch = ntp.getEpochTime();
+    ntpMs = millis();
+    Serial.println("[NTP] epoch " + String(ntpEpoch));
+  }
+  else
+  {
+    Serial.println("[NTP] gagal sinkron");
+  }
+  ntp.end();
+}
+
+// Dipanggil setiap putaran loop(). Hanya saat idle agar tidak mengganggu operator.
+void jagaWaktu()
+{
+  if (!lanOK || !statusIdle())
+    return;
+  unsigned long now = millis();
+  unsigned long batas = (ntpEpoch == 0) ? 30000UL : 21600000UL; // 30 dtk jika belum pernah, 6 jam jika sudah
+  if (ntpCobaMs != 0 && now - ntpCobaMs < batas)
+    return;
+  ntpCobaMs = now;
+  sinkronWaktu();
+}
+
+// Beri tahu BearSSL jam sekarang (hari sejak tahun 0, detik sejak tengah malam)
+void setWaktuTls()
+{
+  if (ntpEpoch == 0)
+    return;
+  uint32_t e = ntpEpoch + (millis() - ntpMs) / 1000UL;
+  httpSSL.setVerificationTime(e / 86400UL + 719528UL, e % 86400UL);
 }
 
 // =====================================================
@@ -912,12 +1115,15 @@ void cekPerintahSerial()
     prefs.end();
     Serial.println("[CFG] otakey tersimpan.");
   }
+  else
+  {
+    perintahSerialDiagnostik(line);
+  }
 }
 
 // =====================================================
 //  KONFIGURASI MELALUI BROWSER (LAN PORT 8080)
 //  Buka: http://IP-ESP32:8080
-//  Server Laravel memakai format IPv4 atau IPv4:PORT.
 // =====================================================
 String decodeFormValue(const String &v)
 {
@@ -963,14 +1169,16 @@ void kirimHalamanKonfigurasi(EthernetClient &c, const String &pesan = "")
   if (pesan.length())
     html += "<p><b>" + pesan + "</b></p>";
   html += "<form method='POST' action='/save'>"
-          "<label>IP Laravel (contoh 192.168.1.10:8000)</label>"
+          "<label>IP atau domain Laravel (contoh https://server.contoh.com atau 192.168.1.10:8000)</label>"
           "<input name='server' required value='" +
           serverHostRuntime + "'>"
                               "<label>API Key Laravel</label><input name='apikey' type='password' placeholder='Kosongkan jika tidak diubah'>"
                               "<label>OTA Device Key</label><input name='otakey' type='password' placeholder='Kosongkan jika tidak diubah'>"
                               "<button type='submit'>Simpan Konfigurasi</button></form>"
                               "<small>API Key dan OTA Key tidak ditampilkan kembali. Perangkat akan memakai nilai yang tersimpan setelah konfigurasi disimpan.</small>"
-                              "<p>IP ESP32: " +
+                              "<p>Mode saat ini: " +
+          String(serverTls ? "HTTPS" : "HTTP") + "</p>"
+                                                 "<p>IP ESP32: " +
           Ethernet.localIP().toString() + "</p></div></body></html>";
   c.println("HTTP/1.1 200 OK");
   c.println("Content-Type: text/html; charset=utf-8");
@@ -1036,15 +1244,14 @@ void prosesWebKonfigurasi()
     api.trim();
     ota.trim();
 
-    int colon = host.indexOf(':');
-    String ipText = (colon >= 0) ? host.substring(0, colon) : host;
-    int port = (colon >= 0) ? host.substring(colon + 1).toInt() : 80;
-    IPAddress testIP;
-    bool valid = testIP.fromString(ipText) && port >= 1 && port <= 65535;
+    String hTmp;
+    int pTmp;
+    bool tTmp;
+    bool valid = uraiAlamat(host, hTmp, pTmp, tTmp);
 
     if (!valid)
     {
-      kirimHalamanKonfigurasi(web, "Format IP/port tidak valid. Gunakan IPv4 atau IPv4:PORT.");
+      kirimHalamanKonfigurasi(web, "Format server tidak valid. Contoh: https://server.contoh.com, server.contoh.com, 192.168.1.10:8000.");
     }
     else
     {
@@ -1077,6 +1284,9 @@ void prosesWebKonfigurasi()
 
 // =====================================================
 //  OTA
+//  CATATAN: pengecekan versi memakai httpRequest() sehingga ikut HTTPS,
+//  tetapi unduhan firmware (unduhDanPasang) masih HTTP biasa. Selama
+//  server memakai HTTPS, OTA dilewati agar layar tidak terganggu.
 // =====================================================
 const unsigned long OTA_CEK_PERTAMA_MS = 30000UL;   // 30 detik setelah boot
 const unsigned long OTA_CEK_INTERVAL_MS = 600000UL; // lalu tiap 10 menit
@@ -1115,7 +1325,7 @@ bool laporOta(const String &versi, const char *status, const String &pesan)
 void laporHasilBoot()
 {
   prefs.begin("cfg", false);
-  String pending = prefs.getString("pending", "");
+  String pending = prefs.isKey("pending") ? prefs.getString("pending", "") : ""; // hindari log error NVS NOT_FOUND
   prefs.end();
   if (pending.length() == 0 || otaKeyRuntime.length() == 0)
     return;
@@ -1131,7 +1341,21 @@ void laporHasilBoot()
   }
 }
 
+void laporProgresOta(const char *state, int pct, const char *msg)
+{
+  if (!client.connected())
+    return;
+  char b[200];
+  if (pct >= 0)
+    snprintf(b, sizeof(b), "{\"state\":\"%s\",\"pct\":%d,\"msg\":\"%s\"}", state, pct, msg);
+  else
+    snprintf(b, sizeof(b), "{\"state\":\"%s\",\"msg\":\"%s\"}", state, msg);
+  client.publish(topicHmiOta, b, false); // retain = false
+  client.loop();
+}
+
 // Unduh dari Laravel, tulis ke flash, hitung SHA-256 selama unduh
+// (masih HTTP biasa, belum mendukung HTTPS)
 bool unduhDanPasang(const String &versi, const String &checksumHex, String &alasan)
 {
   if (Ethernet.linkStatus() == LinkOFF)
@@ -1148,7 +1372,7 @@ bool unduhDanPasang(const String &versi, const String &checksumHex, String &alas
   }
 
   dl.println("GET /api/device/firmware/download?mac=" + macString() + "&device=" + DEVICE_TYPE + "&version=" + versi + " HTTP/1.0");
-  dl.println("Host: " + serverHostRuntime);
+  dl.println("Host: " + hostHeader());
   dl.println("X-Device-Key: " + otaKeyRuntime);
   dl.println("Connection: close");
   dl.println();
@@ -1211,6 +1435,8 @@ bool unduhDanPasang(const String &versi, const String &checksumHex, String &alas
 
   while (diterima < panjang)
   {
+    esp_task_wdt_reset(); // unduhan bisa > 60 detik
+    client.loop();
     int tersedia = dl.available();
     if (tersedia > 0)
     {
@@ -1241,6 +1467,7 @@ bool unduhDanPasang(const String &versi, const String &checksumHex, String &alas
         persenTerakhir = persen;
         lcd.setCursor(0, 2);
         lcd.print("Unduh: " + String(persen) + "%    ");
+        laporProgresOta("downloading", persen, "Mengunduh firmware");
       }
     }
     else
@@ -1287,6 +1514,17 @@ void cekUpdateFirmware()
   if (otaKeyRuntime.length() == 0)
   {
     Serial.println("[OTA] otakey belum diset, dilewati");
+    if (otaManual)
+      laporProgresOta("failed", -1, "OTA key belum diset di HMI");
+    return;
+  }
+
+  // Unduhan firmware belum mendukung HTTPS: lewati sampai OTA dimigrasikan
+  if (serverTls)
+  {
+    Serial.println("[OTA] dilewati: unduhan firmware belum mendukung HTTPS");
+    if (otaManual)
+      laporProgresOta("failed", -1, "OTA belum mendukung HTTPS");
     return;
   }
 
@@ -1294,20 +1532,33 @@ void cekUpdateFirmware()
                 "&device=" + DEVICE_TYPE + "&current_version=" + FW_VERSION;
   HttpHasil r = httpRequest("GET", path, "", "X-Device-Key", otaKeyRuntime);
 
+  // 1. Server harus menjawab 200 dulu
   if (r.status != 200)
   {
     Serial.println("[OTA] cek gagal, HTTP " + String(r.status));
+    if (otaManual)
+      laporProgresOta("failed", -1, ("Server firmware HTTP " + String(r.status)).c_str());
     return;
   }
 
+  // 2. Baca JSON, cek ada update atau tidak
   JsonDocument doc;
   if (deserializeJson(doc, r.body) || !doc["update_available"].as<bool>())
+  {
+    if (otaManual)
+      laporProgresOta("uptodate", -1, "Firmware sudah terbaru");
     return;
+  }
 
+  // 3. Baru sekarang versi dan checksum boleh dipakai
   String versi = doc["latest"]["version"].as<String>();
   String checksum = doc["latest"]["checksum"].as<String>();
   if (versi.length() == 0 || checksum.length() != 64)
+  {
+    if (otaManual)
+      laporProgresOta("failed", -1, "Data rilis dari server tidak valid");
     return;
+  }
 
   Serial.println("[OTA] versi baru: " + versi);
   lcd.clear();
@@ -1326,12 +1577,19 @@ void cekUpdateFirmware()
     prefs.end();
     lcd.setCursor(0, 2);
     lcd.print("Selesai, restart... ");
-    delay(1500);
+    laporProgresOta("installing", 100, "Terpasang, HMI restart");
+    for (int i = 0; i < 10; i++) // beri waktu pesan terkirim
+    {
+      client.loop();
+      delay(50);
+    }
+    delay(1000);
     ESP.restart();
   }
 
   Serial.println("[OTA] GAGAL: " + alasan);
   laporOta(versi, "failed", alasan);
+  laporProgresOta("failed", -1, alasan.c_str());
   lcd.setCursor(0, 2);
   lcd.print("Update gagal        ");
   delay(2500);
@@ -1361,16 +1619,27 @@ void cekOtaBerkala()
 // =====================================================
 //  SETUP & LOOP
 // =====================================================
+#include "diagnostik.h"
 void setup()
 {
   Serial.begin(115200);
+  Serial.println();
+  Serial.println("========== BOOT DIAGNOSTIC ==========");
+  Serial.printf("Reset reason: %d\n", esp_reset_reason());
+  Serial.printf("Free heap: %lu\n", (unsigned long)ESP.getFreeHeap());
+  Serial.println("=====================================");
   muatKunci();
   Serial.println("\n--- HMI SANDING IOT (ETHERNET W5500 + NEW PINS) ---");
 
-  pinMode(PIN_CLK, INPUT_PULLUP);
-  pinMode(PIN_DT, INPUT_PULLUP);
+  // Tombol OK dan BACK tetap dibaca biasa. CLK/DT dikelola ESP32Encoder (PCNT).
   pinMode(PIN_SW, INPUT_PULLUP);
   pinMode(PIN_BTN_PIN4, INPUT_PULLUP);
+
+  ESP32Encoder::useInternalWeakPullResistors = puType::up; // GPIO35 tetap butuh pull-up eksternal 10k
+  enc.attachHalfQuad(PIN_CLK, PIN_DT);
+  enc.setFilter(1023); // filter glitch ~12,8 us
+  enc.clearCount();
+  encTerakhir = 0;
 
   lcd.init();
   lcd.backlight();
@@ -1401,18 +1670,23 @@ void setup()
   linkUp = (Ethernet.linkStatus() != LinkOFF);
   lanOK = adaIP();
 
+  httpSSL.setTimeout(SSL_TIMEOUT_MS); // sebelumnya 30 dtk (bawaan SSLClient)
+
   client.setServer(mqttServer, mqttPort);
   client.setCallback(mqttCallback);
-  client.setBufferSize(640); // default 256 byte tidak cukup untuk JSON diag
-  client.setKeepAlive(15);
+  client.setBufferSize(640);  // default 256 byte tidak cukup untuk JSON diag
+  client.setKeepAlive(60);    // sebelumnya 15: toleran terhadap loop() yang tertahan beberapa detik
   client.setSocketTimeout(3); // koneksi gagal tidak menahan UI lama
   mqttTryConnect();
   lastMqttAttempt = millis();
   aktifkanWatchdog();
 
   siapkanAlamatServer(); // gunakan alamat server dari NVS atau config.h
+  sinkronWaktu();        // jam harus benar sebelum HTTPS pertama
+  ntpCobaMs = millis();
   configServer.begin();
   Serial.println("[CFG] Halaman konfigurasi: http://" + Ethernet.localIP().toString() + ":8080");
+  Serial.println("[CFG] Ketik 'help' untuk daftar perintah diagnostik");
   laporHasilBoot();
   lastStateCLK = digitalRead(PIN_CLK);
   fetchDataFromAPI(false);
@@ -1422,6 +1696,7 @@ void setup()
 void loop()
 {
   esp_task_wdt_reset();
+  ukurLoop();
   cekPerintahSerial();
   prosesWebKonfigurasi();
   if (!client.connected())
@@ -1433,7 +1708,43 @@ void loop()
     client.loop();
   }
   pantauJaringan();
-  cekOtaBerkala();
+  if (!hwTestAktif)
+    cekOtaBerkala();
+  jagaWaktu();
+  tickDiagnostik();
+
+  if (otaDiminta)
+  {
+    otaDiminta = false;
+    if (statusIdle())
+    {
+      otaManual = true;
+      laporProgresOta("checking", -1, "Memeriksa update");
+      cekUpdateFirmware();
+      otaManual = false;
+    }
+    else
+    {
+      laporProgresOta("failed", -1, "Mesin sedang bekerja, coba saat idle");
+    }
+  }
+
+  // Buang putaran encoder yang tidak boleh "bocor" ke layar lain:
+  // saat tes hardware, saat pindah state, dan di state yang tidak memakai encoder.
+  static State stateSebelumnya = currentState;
+  if (hwTestAktif || currentState != stateSebelumnya ||
+      currentState == STATE_SANDING_RUNNING || currentState == STATE_KIRIM_DATA)
+  {
+    ambilLangkahEncoder();
+    stateSebelumnya = currentState;
+  }
+
+  // Mode tes hardware: aksi tombol tidak diteruskan ke aplikasi
+  if (hwTestAktif)
+  {
+    hwTestLoop();
+    return;
+  }
 
   switch (currentState)
   {
@@ -1465,15 +1776,109 @@ void loop()
 }
 
 // =====================================================
-//  [TAHAP 1] FUNGSI HTTP UTAMA (dipakai GET & semua POST)
+//  FUNGSI HTTP/HTTPS UTAMA (dipakai GET & semua POST)
 //  Mengembalikan status code HTTP asli + body balasan.
 //  Kode negatif = error buatan kita (-1, -100, -101).
 // =====================================================
 
-HttpHasil httpRequest(const char *method, const String &path, const String &body,
-                      const char *namaHeader, const String &nilaiHeader)
+void tutupKoneksiHTTP()
+{
+  if (serverTls)
+  {
+    httpSSL.stop();
+    httpBase.stop();
+  }
+  else
+  {
+    httpPlain.stop();
+  }
+}
+
+bool bukaKoneksi()
+{
+  // Bersihkan koneksi lama sebelum membuka koneksi baru
+  tutupKoneksiHTTP();
+
+  if (serverTls)
+  {
+    // HTTPS membutuhkan waktu yang valid untuk verifikasi sertifikat
+    if (ntpEpoch == 0)
+    {
+      Serial.println("[HTTP] GAGAL: waktu NTP belum tersedia");
+      return false;
+    }
+
+    setWaktuTls();
+
+    unsigned long mulai = millis();
+    bool berhasil = httpSSL.connect(serverHost.c_str(), serverPortNum);
+
+    Serial.printf("[HTTP] HTTPS connect: %lu ms, hasil=%s\n",
+                  millis() - mulai, berhasil ? "OK" : "GAGAL");
+
+    if (!berhasil)
+      tutupKoneksiHTTP();
+
+    return berhasil;
+  }
+
+  unsigned long mulai = millis();
+  bool berhasil = httpPlain.connect(serverAddr, serverPortNum);
+
+  Serial.printf("[HTTP] HTTP connect: %lu ms, hasil=%s\n",
+                millis() - mulai, berhasil ? "OK" : "GAGAL");
+
+  if (!berhasil)
+    tutupKoneksiHTTP();
+
+  return berhasil;
+}
+
+// Membaca satu baris. available() hanya dipanggil selagi koneksi masih terbuka
+// sehingga pesan "Cannot operate on a closed SSL connection" tidak muncul lagi.
+bool bacaBarisHTTP(Client &c, String &baris, unsigned long deadline)
+{
+  baris = "";
+
+  while ((long)(deadline - millis()) > 0)
+  {
+    esp_task_wdt_reset();
+
+    if (client.connected())
+      client.loop();
+
+    if (!c.connected())
+      return false; // sesi sudah tertutup dan buffer kosong
+
+    while (c.available())
+    {
+      char ch = (char)c.read();
+
+      if (ch == '\n')
+        return true;
+
+      if (ch != '\r')
+      {
+        if (baris.length() >= 512)
+          return false;
+
+        baris += ch;
+      }
+    }
+
+    delay(1);
+  }
+
+  return false;
+}
+
+HttpHasil httpRequestMentah(const char *method, const String &path, const String &body,
+                            const char *namaHeader, const String &nilaiHeader)
 {
   HttpHasil hasil = {0, ""};
+
+  const unsigned long HTTP_TIMEOUT_MS = 10000;
+  const unsigned long HTTP_BODY_MAX = 8192;
 
   if (Ethernet.linkStatus() == LinkOFF)
   {
@@ -1481,77 +1886,189 @@ HttpHasil httpRequest(const char *method, const String &path, const String &body
     return hasil;
   }
 
-  if (!httpClient.connect(serverAddr, serverPortNum))
+  if (serverTls && ntpEpoch == 0)
   {
+    Serial.println("[HTTP] HTTPS dibatalkan: waktu NTP belum tersedia");
     hasil.status = -1;
     return hasil;
   }
 
-  httpClient.println(String(method) + " " + path + " HTTP/1.0");
-  httpClient.println("Host: " + serverHostRuntime);
-  httpClient.println("Accept: application/json");
+  if (!bukaKoneksi())
+  {
+    Serial.println("[HTTP] Koneksi gagal");
+    hasil.status = -1;
+    return hasil;
+  }
+
+  // Deadline dihitung SETELAH connect, supaya waktu connect tidak menghabiskan jatah baca.
+  unsigned long deadline = millis() + HTTP_TIMEOUT_MS;
+
+  Client &c = serverTls ? (Client &)httpSSL : (Client &)httpPlain;
+
+  c.println(String(method) + " " + path + " HTTP/1.0");
+  c.println("Host: " + hostHeader());
+  c.println("Accept: application/json");
+
   if (namaHeader != nullptr)
   {
     if (nilaiHeader.length() > 0)
-      httpClient.println(String(namaHeader) + ": " + nilaiHeader);
+      c.println(String(namaHeader) + ": " + nilaiHeader);
   }
   else if (apiKeyRuntime.length() > 0)
   {
-    httpClient.println("X-API-KEY: " + apiKeyRuntime);
-  }
-  httpClient.println("Connection: close");
-  if (body.length() > 0)
-  {
-    httpClient.println("Content-Type: application/json");
-    httpClient.println("Content-Length: " + String(body.length()));
-  }
-  httpClient.println();
-  if (body.length() > 0)
-    httpClient.print(body);
-
-  unsigned long mulai = millis();
-  while (httpClient.connected() && !httpClient.available())
-  {
-    if (millis() - mulai > 5000)
-    {
-      httpClient.stop();
-      hasil.status = -1;
-      return hasil;
-    }
-    delay(10);
+    c.println("X-API-KEY: " + apiKeyRuntime);
   }
 
-  String statusLine = httpClient.readStringUntil('\n');
+  c.println("Connection: close");
+
+  if (body.length() > 0)
+  {
+    c.println("Content-Type: application/json");
+    c.println("Content-Length: " + String(body.length()));
+  }
+
+  c.println();
+
+  if (body.length() > 0)
+    c.print(body);
+
+  // 1. Baca status HTTP.
+  String statusLine;
+
+  if (!bacaBarisHTTP(c, statusLine, deadline))
+  {
+    Serial.println("[HTTP] timeout membaca status");
+    c.stop();
+    hasil.status = -1;
+    return hasil;
+  }
+
   int spasi = statusLine.indexOf(' ');
+
   if (spasi < 0)
   {
-    httpClient.stop();
+    c.stop();
     hasil.status = ERR_DATA_TIDAK_VALID;
     return hasil;
   }
-  hasil.status = statusLine.substring(spasi + 1, spasi + 4).toInt();
-  if (hasil.status == 0)
-    hasil.status = ERR_DATA_TIDAK_VALID;
 
-  while (httpClient.connected() || httpClient.available())
+  hasil.status = statusLine.substring(spasi + 1, spasi + 4).toInt();
+
+  if (hasil.status == 0)
   {
-    String line = httpClient.readStringUntil('\n');
-    if (line == "\r" || line.length() == 0)
-      break;
+    c.stop();
+    hasil.status = ERR_DATA_TIDAK_VALID;
+    return hasil;
   }
 
-  unsigned long terakhir = millis();
-  while ((httpClient.connected() || httpClient.available()) && millis() - terakhir < 3000)
+  // 2. Baca seluruh header sampai baris kosong, catat Content-Length.
+  bool headerSelesai = false;
+  long panjangBody = -1;
+
+  while ((long)(deadline - millis()) > 0)
   {
-    while (httpClient.available())
+    String header;
+
+    if (!bacaBarisHTTP(c, header, deadline))
+      break;
+
+    if (header.length() == 0)
     {
-      hasil.body += (char)httpClient.read();
-      terakhir = millis();
+      headerSelesai = true;
+      break;
     }
+
+    header.toLowerCase();
+    if (header.startsWith("content-length:"))
+      panjangBody = header.substring(15).toInt();
+  }
+
+  if (!headerSelesai)
+  {
+    Serial.println("[HTTP] timeout membaca header");
+    c.stop();
+    hasil.status = -1;
+    return hasil;
+  }
+
+  // 3. Baca body. Berhenti begitu body LENGKAP, tanpa menunggu server menutup sesi TLS.
+  //    available() pada SSLClient memblokir sampai timeout bila dipanggil setelah data
+  //    habis dan server belum menutup sesi, jadi tidak boleh dipanggil lagi setelah lengkap.
+  //    Lengkap = panjang sama dengan Content-Length; tanpa Content-Length = kurung JSON tertutup.
+  int kedalaman = 0;
+  bool dalamString = false, escape = false, mulaiJson = false;
+
+  while ((long)(deadline - millis()) > 0)
+  {
+    esp_task_wdt_reset();
+
+    if (client.connected())
+      client.loop();
+
+    while ((panjangBody < 0 || (long)hasil.body.length() < panjangBody) && c.available())
+    {
+      if (hasil.body.length() >= HTTP_BODY_MAX)
+      {
+        Serial.println("[HTTP] body terlalu besar");
+        c.stop();
+        hasil.status = ERR_DATA_TIDAK_VALID;
+        hasil.body = "";
+        return hasil;
+      }
+
+      char ch = (char)c.read();
+      hasil.body += ch;
+
+      if (panjangBody < 0) // tanpa Content-Length: deteksi akhir JSON
+      {
+        if (dalamString)
+        {
+          if (escape)
+            escape = false;
+          else if (ch == '\\')
+            escape = true;
+          else if (ch == '"')
+            dalamString = false;
+        }
+        else if (ch == '"')
+          dalamString = true;
+        else if (ch == '{' || ch == '[')
+        {
+          kedalaman++;
+          mulaiJson = true;
+        }
+        else if (ch == '}' || ch == ']')
+          kedalaman--;
+
+        if (mulaiJson && kedalaman <= 0)
+        {
+          c.stop();
+          return hasil;
+        }
+      }
+    }
+
+    if (panjangBody >= 0 && (long)hasil.body.length() >= panjangBody)
+    {
+      c.stop();
+      return hasil;
+    }
+
+    if (!c.connected())
+    {
+      c.stop();
+      return hasil; // server menutup sesi = body sudah lengkap
+    }
+
     delay(1);
   }
 
-  httpClient.stop();
+  // Deadline tercapai sebelum respons selesai.
+  Serial.println("[HTTP] timeout membaca body");
+  c.stop();
+  hasil.status = -1;
+  hasil.body = "";
+
   return hasil;
 }
 
@@ -1721,21 +2238,13 @@ void handlePilihDataMenu()
   if (currentState != STATE_PILIH_DATA)
     return;
 
-  int currentStateCLK = digitalRead(PIN_CLK);
-  if (currentStateCLK != lastStateCLK && currentStateCLK == LOW)
+  int d = ambilLangkahEncoder();
+  if (d != 0)
   {
     lastInteractionMs = millis();
-    if (digitalRead(PIN_DT) == HIGH)
-    {
-      indexData = (indexData + 1) % totalDataMaster;
-    }
-    else
-    {
-      indexData = (indexData - 1 + totalDataMaster) % totalDataMaster;
-    }
+    indexData = ((indexData + d) % totalDataMaster + totalDataMaster) % totalDataMaster;
     updateDisplayPilihData();
   }
-  lastStateCLK = currentStateCLK;
 
   if (digitalRead(PIN_SW) == LOW)
   {
@@ -1769,13 +2278,11 @@ void updateDisplayPilihData()
 // =====================================================
 void handlePilihSisiMenu()
 {
-  int currentStateCLK = digitalRead(PIN_CLK);
-  if (currentStateCLK != lastStateCLK && currentStateCLK == LOW)
+  if (ambilLangkahEncoder() != 0)
   {
     selectedSisi = (selectedSisi == "FACE") ? "BACK" : "FACE";
     updateDisplayPilihSisi();
   }
-  lastStateCLK = currentStateCLK;
 
   if (digitalRead(PIN_BTN_PIN4) == LOW)
   {
@@ -1801,7 +2308,6 @@ void handlePilihSisiMenu()
       return;
     }
     // Perintah MULAI: sensor nol-kan angka lalu mulai menghitung.
-    // Sebelum titik ini sensor TIDAK menghitung apa pun (noise diabaikan).
     // Kalau sensor tidak membalas, jangan masuk ke layar hitung.
     lcd.clear();
     lcd.setCursor(0, 0);
@@ -1895,12 +2401,8 @@ void handleSandingRunning()
     lastStatus = statusTampil;
   }
 
-  // CATATAN: tidak ada lagi kirim otomatis. Pengawas yang menekan OK.
-
   // ---- BACK DIKUNCI di layar ini ----
-  // Menekan BACK sebentar tidak berbuat apa-apa karena perhitungan dan
-  // pencocokan sedang berjalan. Pembatalan darurat hanya lewat tahan lama
-  // (TAHAN_BATAL_MS) agar tidak terjadi tidak sengaja.
+  // Pembatalan darurat hanya lewat tahan lama (TAHAN_BATAL_MS).
   if (IZINKAN_BATAL_TAHAN)
   {
     if (digitalRead(PIN_BTN_PIN4) == LOW)
@@ -1948,25 +2450,23 @@ void handleSandingRunning()
 // =====================================================
 void handleKoreksiManual()
 {
-  int currentStateCLK = digitalRead(PIN_CLK);
-  if (currentStateCLK != lastStateCLK && currentStateCLK == LOW)
+  int d = ambilLangkahEncoder();
+  if (d != 0)
   {
-    int delta = (digitalRead(PIN_DT) == HIGH) ? 1 : -1;
     if (koreksiField == 0)
     {
-      jumlahMasuk += delta;
+      jumlahMasuk += d;
       if (jumlahMasuk < 0)
         jumlahMasuk = 0;
     }
     else
     {
-      jumlahKeluar += delta;
+      jumlahKeluar += d;
       if (jumlahKeluar < 0)
         jumlahKeluar = 0;
     }
     updateDisplayKoreksi();
   }
-  lastStateCLK = currentStateCLK;
 
   if (digitalRead(PIN_BTN_PIN4) == LOW)
   {
@@ -2030,16 +2530,12 @@ void updateDisplayKoreksi()
 // =====================================================
 void handleValidasiMenu()
 {
-  int currentStateCLK = digitalRead(PIN_CLK);
-  if (currentStateCLK != lastStateCLK && currentStateCLK == LOW)
+  int d = ambilLangkahEncoder();
+  if (d != 0)
   {
-    if (digitalRead(PIN_DT) == HIGH)
-      alasanIndex = (alasanIndex + 1) % totalAlasan;
-    else
-      alasanIndex = (alasanIndex - 1 + totalAlasan) % totalAlasan;
+    alasanIndex = ((alasanIndex + d) % totalAlasan + totalAlasan) % totalAlasan;
     updateDisplayValidasi();
   }
-  lastStateCLK = currentStateCLK;
 
   if (digitalRead(PIN_BTN_PIN4) == LOW)
   {
@@ -2083,7 +2579,7 @@ void updateDisplayValidasi()
 }
 
 // =====================================================
-//  [TAHAP 1] HTTP POST: KIRIM DATA PUTARAN
+//  HTTP POST: KIRIM DATA PUTARAN
 //  Sukses HANYA jika server membalas 2xx.
 // =====================================================
 void kirimDataKeServer()
@@ -2131,8 +2627,6 @@ void kirimDataKeServer()
     lcd.print("Kirim Berhasil! ");
 
     // Data sudah aman di server -> sensor berhenti hitung & kembali ke 0.
-    // Kalau gagal, tidak fatal: putaran berikutnya diawali START yang
-    // meng-nol-kan angka lagi, dan START wajib terkonfirmasi.
     lcd.setCursor(0, 2);
     lcd.print("Stop sensor...");
     bool stopOk = hentikanHitungSensor();
@@ -2182,16 +2676,11 @@ void handleKonfirmasiLagi()
 {
   bool semuaPenuh = (putaranFace >= MAX_PUTARAN_PER_SISI && putaranBack >= MAX_PUTARAN_PER_SISI);
 
-  int currentStateCLK = digitalRead(PIN_CLK);
-  if (currentStateCLK != lastStateCLK && currentStateCLK == LOW)
+  if (ambilLangkahEncoder() != 0 && !semuaPenuh)
   {
-    if (!semuaPenuh)
-    {
-      sandingLagi = !sandingLagi;
-      updateDisplayKonfirmasi();
-    }
+    sandingLagi = !sandingLagi;
+    updateDisplayKonfirmasi();
   }
-  lastStateCLK = currentStateCLK;
 
   if (digitalRead(PIN_SW) == LOW)
   {
@@ -2228,7 +2717,7 @@ void updateDisplayKonfirmasi()
 }
 
 // =====================================================
-//  [TAHAP 1] HTTP POST: TUTUP PALET
+//  HTTP POST: TUTUP PALET
 //  Return 0 = sukses, selain itu = kode error.
 // =====================================================
 int tutupPaletDiServer()
