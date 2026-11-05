@@ -14,7 +14,6 @@
 #include <Dns.h>
 #include <SSLClient.h>
 #include <NTPClient.h>
-#include <ESP32Encoder.h>  // BARU: pembacaan encoder lewat hardware PCNT
 #include "trust_anchors.h" // dibuat dengan pycert_bearssl.py: array TAs dan konstanta TAs_NUM
 
 volatile bool otaDiminta = false;
@@ -90,15 +89,35 @@ const int PIN_BTN_PIN4 = 4; // Tombol fisik tunggal (BACK)
 //  oleh HTTP/TLS/LCD. ambilLangkahEncoder() mengembalikan jumlah "klik"
 //  sejak pemanggilan terakhir (+ = searah jarum jam).
 // =====================================================
-ESP32Encoder enc;
-int64_t encTerakhir = 0;
+// =====================================================
+//  ENCODER (POLLING + DEBOUNCE)
+//  ambilLangkahEncoder() mengembalikan:
+//    +1 = putar searah jarum jam, -1 = berlawanan, 0 = tidak ada putaran
+//  Tepi CLK yang datang < ENC_DEBOUNCE_US setelah klik sebelumnya
+//  dianggap pantulan kontak dan diabaikan.
+// =====================================================
+const unsigned long ENC_DEBOUNCE_US = 1500;
+uint8_t encPrevCLK = HIGH;
+unsigned long encLastEdgeUs = 0;
 
 int ambilLangkahEncoder()
 {
-  int64_t pos = enc.getCount();
-  int64_t langkah = (pos - encTerakhir) / 2; // attachHalfQuad: 2 pulsa per klik
-  encTerakhir += langkah * 2;
-  return (int)langkah;
+  int langkah = 0;
+  uint8_t clk = digitalRead(PIN_CLK);
+
+  if (clk != encPrevCLK) // ada perubahan level di CLK
+  {
+    unsigned long now = micros();
+
+    // Hanya tepi turun (HIGH -> LOW) yang dihitung sebagai 1 klik
+    if (clk == LOW && (now - encLastEdgeUs) > ENC_DEBOUNCE_US)
+    {
+      langkah = (digitalRead(PIN_DT) == HIGH) ? 1 : -1;
+      encLastEdgeUs = now;
+    }
+    encPrevCLK = clk;
+  }
+  return langkah;
 }
 
 // =====================================================
@@ -166,6 +185,8 @@ void selesaikanSesi();
 
 void publishIP();
 void publishDiag();
+void publishAktif(bool aktif);
+bool sedangSanding();
 void restartDevice(const char *alasan);
 
 void handleFetchApi();
@@ -291,6 +312,7 @@ const char *topicHmiIP = TOPIC_HMI "ip";
 const char *topicHmiDiag = TOPIC_HMI "diag";
 const char *topicHmiPerintah = TOPIC_HMI "perintah";
 const char *topicHmiOta = TOPIC_HMI "ota";
+const char *topicHmiAktif = TOPIC_HMI "aktif"; // item yang sedang di-sanding (retained; kosong = tidak ada)
 bool otaManual = false;
 
 const unsigned long ETH_CHECK_INTERVAL = 3000UL;
@@ -690,6 +712,8 @@ bool mqttTryConnect()
     client.subscribe(topicHmiPerintah);
     client.publish(topicHmiStatus, "1", true);
     publishIP();
+    // Setelah boot/sambung ulang: hapus pesan aktif basi, atau kirim ulang jika memang sedang sanding
+    publishAktif(sedangSanding());
     diagSegera = true;
     lastHeartbeat = millis();
     logMqttPercobaan(true, 0, dur);
@@ -758,13 +782,17 @@ bool mulaiHitungSensor()
 {
   bool ok = kirimPerintahSensor("START", "START_OK");
   if (ok)
+  {
     sensorMode = "ON";
+    publishAktif(true); // dashboard: item ini sedang di-sanding
+  }
   return ok;
 }
 
 // STOP: sensor berhenti menghitung lalu nol-kan angka
 bool hentikanHitungSensor()
 {
+  publishAktif(false); // dipakai batal darurat dan kirim sukses: sanding berakhir apa pun balasan sensor
   bool ok = kirimPerintahSensor("STOP", "STOP_OK");
   if (ok)
     sensorMode = "OFF";
@@ -909,6 +937,47 @@ uint32_t hashString(const String &s)
 int putaranSisiTerpilih()
 {
   return (selectedSisi == "FACE") ? putaranFace : putaranBack;
+}
+
+// =====================================================
+//  ITEM AKTIF KE DASHBOARD (topik pabrik/hmi_sanding/aktif, retained)
+//  Berisi barang yang sedang di-sanding. Payload kosong = tidak ada sanding berjalan.
+// =====================================================
+// Sanding dianggap berjalan sejak sensor START sampai data terkirim / dibatalkan.
+bool sedangSanding()
+{
+  return currentState == STATE_SANDING_RUNNING || currentState == STATE_KOREKSI_MANUAL ||
+         currentState == STATE_VALIDASI_SELISIH || currentState == STATE_KIRIM_DATA;
+}
+
+void publishAktif(bool aktif)
+{
+  if (!client.connected())
+    return;
+  if (!aktif || totalDataMaster == 0)
+  {
+    client.publish(topicHmiAktif, "", true); // payload kosong menghapus pesan retained
+    return;
+  }
+
+  JsonDocument d;
+  d["id"] = apiIds[indexData];
+  d["barang"] = masterBaris1[indexData];
+  d["no_palet"] = apiNoPalet[indexData];
+  d["target"] = masterModal[indexData];
+  d["sisi"] = selectedSisi;
+  d["putaran_ke"] = putaranSisiTerpilih() + 1;
+  d["mesin"] = apiMesin;
+  d["shift"] = apiShift;
+
+  char b[320];
+  size_t n = serializeJson(d, b, sizeof(b));
+  if (n == 0 || n >= sizeof(b))
+  {
+    Serial.println("[AKTIF] payload terpotong, tidak dikirim");
+    return;
+  }
+  client.publish(topicHmiAktif, b, true);
 }
 
 // =====================================================
@@ -1634,12 +1703,9 @@ void setup()
   // Tombol OK dan BACK tetap dibaca biasa. CLK/DT dikelola ESP32Encoder (PCNT).
   pinMode(PIN_SW, INPUT_PULLUP);
   pinMode(PIN_BTN_PIN4, INPUT_PULLUP);
-
-  ESP32Encoder::useInternalWeakPullResistors = puType::up; // GPIO35 tetap butuh pull-up eksternal 10k
-  enc.attachHalfQuad(PIN_CLK, PIN_DT);
-  enc.setFilter(1023); // filter glitch ~12,8 us
-  enc.clearCount();
-  encTerakhir = 0;
+  pinMode(PIN_CLK, INPUT_PULLUP);
+  pinMode(PIN_DT, INPUT_PULLUP); // GPIO35 tidak punya pull-up internal: tetap pakai 10k eksternal
+  encPrevCLK = digitalRead(PIN_CLK);
 
   lcd.init();
   lcd.backlight();
