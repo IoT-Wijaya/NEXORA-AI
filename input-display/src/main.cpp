@@ -14,7 +14,6 @@
 #include <Dns.h>
 #include <SSLClient.h>
 #include <NTPClient.h>
-#include <ESP32Encoder.h>  // BARU: pembacaan encoder lewat hardware PCNT
 #include "trust_anchors.h" // dibuat dengan pycert_bearssl.py: array TAs dan konstanta TAs_NUM
 
 volatile bool otaDiminta = false;
@@ -90,15 +89,35 @@ const int PIN_BTN_PIN4 = 4; // Tombol fisik tunggal (BACK)
 //  oleh HTTP/TLS/LCD. ambilLangkahEncoder() mengembalikan jumlah "klik"
 //  sejak pemanggilan terakhir (+ = searah jarum jam).
 // =====================================================
-ESP32Encoder enc;
-int64_t encTerakhir = 0;
+// =====================================================
+//  ENCODER (POLLING + DEBOUNCE)
+//  ambilLangkahEncoder() mengembalikan:
+//    +1 = putar searah jarum jam, -1 = berlawanan, 0 = tidak ada putaran
+//  Tepi CLK yang datang < ENC_DEBOUNCE_US setelah klik sebelumnya
+//  dianggap pantulan kontak dan diabaikan.
+// =====================================================
+const unsigned long ENC_DEBOUNCE_US = 1500;
+uint8_t encPrevCLK = HIGH;
+unsigned long encLastEdgeUs = 0;
 
 int ambilLangkahEncoder()
 {
-  int64_t pos = enc.getCount();
-  int64_t langkah = (pos - encTerakhir) / 2; // attachHalfQuad: 2 pulsa per klik
-  encTerakhir += langkah * 2;
-  return (int)langkah;
+  int langkah = 0;
+  uint8_t clk = digitalRead(PIN_CLK);
+
+  if (clk != encPrevCLK) // ada perubahan level di CLK
+  {
+    unsigned long now = micros();
+
+    // Hanya tepi turun (HIGH -> LOW) yang dihitung sebagai 1 klik
+    if (clk == LOW && (now - encLastEdgeUs) > ENC_DEBOUNCE_US)
+    {
+      langkah = (digitalRead(PIN_DT) == HIGH) ? 1 : -1;
+      encLastEdgeUs = now;
+    }
+    encPrevCLK = clk;
+  }
+  return langkah;
 }
 
 // =====================================================
@@ -1634,12 +1653,9 @@ void setup()
   // Tombol OK dan BACK tetap dibaca biasa. CLK/DT dikelola ESP32Encoder (PCNT).
   pinMode(PIN_SW, INPUT_PULLUP);
   pinMode(PIN_BTN_PIN4, INPUT_PULLUP);
-
-  ESP32Encoder::useInternalWeakPullResistors = puType::up; // GPIO35 tetap butuh pull-up eksternal 10k
-  enc.attachHalfQuad(PIN_CLK, PIN_DT);
-  enc.setFilter(1023); // filter glitch ~12,8 us
-  enc.clearCount();
-  encTerakhir = 0;
+  pinMode(PIN_CLK, INPUT_PULLUP);
+  pinMode(PIN_DT, INPUT_PULLUP); // GPIO35 tidak punya pull-up internal: tetap pakai 10k eksternal
+  encPrevCLK = digitalRead(PIN_CLK);
 
   lcd.init();
   lcd.backlight();

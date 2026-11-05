@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
+#include "config.h"
 #include "secrets.h"
 // =====================================================
 // SANDING BESAR - ESP32 + W5500 + LCD 20x4 + MQTT VPS
