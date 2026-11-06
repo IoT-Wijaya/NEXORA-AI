@@ -8,9 +8,10 @@ class PubSubMqttClient : public IMqttClient
 public:
     PubSubMqttClient(Client &network, const char *host, uint16_t port) : client_(network)
     {
-        client_.setServer(host, port);
         client_.setSocketTimeout(config::MQTT_SOCKET_TIMEOUT_S);
     }
+
+    void setServer(const char *host, uint16_t port) { client_.setServer(host, port); }
 
     bool connected() override { return client_.connected(); }
     bool connect(const MqttConnectParams &p) override
