@@ -1,96 +1,37 @@
-#include <Wire.h>
-#include <SPI.h>
-#include <EthernetENC.h>
-#include <PubSubClient.h>
-#include <LiquidCrystal_I2C.h>
 #include "secrets.h"
+#include "sanding_config.h"
+#include "sensor_filter.h"
+#include "counter_store.h"
+#include "esp_spin_lock.h"
+#include "command_parser.h"
+#include "net_monitor.h"
+#include "enc_driver.h"
+#include "pubsub_mqtt_client.h"
+#include "mqtt_service.h"
+#include "lcd_view.h"
+#include "i2c_lcd_display.h"
+#include "device_identity.h"
+#include "esp_mac_source.h"
 
-// =====================================================
-// ATURAN UTAMA KODE INI
-// -----------------------------------------------------
-// sensorTask  (core 0): HANYA menghitung sensor & tombol reset.
-//                       Tidak menyentuh MQTT atau LCD.
-// networkTask (core 1): SATU-SATUNYA pemilik MQTT dan LCD.
-//
-// Dua task tidak boleh memakai objek yang sama
-// (client MQTT, LCD) karena library-nya tidak thread-safe.
-// Komunikasi antar task lewat counter + bendera counterDirty.
-// =====================================================
+using namespace config;
 
-// =====================================================
-// KONFIGURASI LCD
-// =====================================================
-#define LCD_ADDRESS 0x27
-#define LCD_COLUMNS 16
-#define LCD_ROWS 2
+I2cLcdDisplay lcdDisplay;
+LcdView lcdView(lcdDisplay, namaMesin, LCD_PAGE_INTERVAL);
 
-LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
-
-// =====================================================
-// KONFIGURASI ENC28J60
-// =====================================================
-#define ENC_CS_PIN 5
-#define ENC_SCK 18
-#define ENC_MISO 19
-#define ENC_MOSI 23
-
-byte mac[] = DEVICE_MAC;
+EspMacSource macSource;
+DeviceIdentity identity(macSource, config::clientIdPrefix);
+EncDriver encDriver(identity);
+NetMonitor netMonitor(encDriver, DHCP_RETRY_INTERVAL);
 
 EthernetClient ethClient;
-PubSubClient client(ethClient);
-
-// Slug mesin di Laravel HARUS sama dengan bagian ini ("sanding")
-#define TOPIC_BASE "pabrik/sanding/"
-
-const char *topicStatus = TOPIC_BASE "status";
-const char *topicJumlah = TOPIC_BASE "jumlah";
-const char *topicJumlah2 = TOPIC_BASE "jumlah2";
-const char *topicIP = TOPIC_BASE "ip";
-const char *topicPerintah = TOPIC_BASE "perintah";
-const char *topicAck = TOPIC_BASE "ack";   // balasan konfirmasi ke HMI
-const char *topicMode = TOPIC_BASE "mode"; // "ON" / "OFF" (retained)
-
-// =====================================================
-// NAMA MESIN (maksimal 10 karakter agar muat di LCD)
-// =====================================================
-const char *namaMesin = "SANDINGKCL";
-
-// =====================================================
-// PIN
-// =====================================================
-#define SENSOR_HASIL 27
-#define SENSOR_MODAL 32
-#define RESET_BUTTON 0 // GPIO0 = pin boot, jangan ditahan saat menyalakan
-
-// Sensor aktif LOW
-#define SENSOR_ACTIVE LOW
-
-// =====================================================
-// WAKTU (ms)
-// =====================================================
-const unsigned long PRESS_STABLE_TIME = 100;
-const unsigned long RELEASE_STABLE_TIME = 400;
-const unsigned long RESET_DEBOUNCE_TIME = 50;
-
-const unsigned long LCD_PAGE_INTERVAL = 30000UL;
-const unsigned long ETH_CHECK_INTERVAL = 3000UL;
-const unsigned long DHCP_RETRY_INTERVAL = 15000UL;
-const unsigned long MQTT_RECONNECT_INTERVAL = 5000UL;
-
-// Harus JAUH di bawah 15 detik: Laravel menganggap OFFLINE
-// jika tidak ada pesan lebih dari 15 detik.
-const unsigned long HEARTBEAT_INTERVAL = 5000UL;
+PubSubMqttClient mqttClient(ethClient, mqtt_server, mqtt_port);
+MqttService mqtt(mqttClient);
 
 // =====================================================
 // COUNTER (dibagi antar task, selalu diakses lewat mutex)
 // =====================================================
-volatile unsigned long jumlahHasil = 0;
-volatile unsigned long jumlahModal = 0;
-
-// Bendera: "ada perubahan counter, tolong publish & update LCD"
-volatile bool counterDirty = false;
-
-portMUX_TYPE counterMux = portMUX_INITIALIZER_UNLOCKED;
+EspSpinLock counterLock;
+CounterStore counters(counterLock);
 
 // =====================================================
 // SAKLAR HITUNG
@@ -108,271 +49,104 @@ const char *ackPesan = nullptr;
 // =====================================================
 // STATUS JARINGAN & LCD (hanya diubah oleh networkTask)
 // =====================================================
-volatile bool lanOK = false;
-volatile bool mqttOK = false;
-
-bool lcdMachinePage = false;
-unsigned long lcdLastChange = 0;
 
 unsigned long lastEthCheck = 0;
-unsigned long lastDhcpTry = 0;
-unsigned long lastMQTTReconnect = 0;
-unsigned long lastHeartbeat = 0;
 
-// =====================================================
-// DATA FILTER SENSOR
-// Satu struct dipakai untuk semua sensor (tidak ditulis ulang)
-// =====================================================
-struct Sensor
-{
-  uint8_t pin;
-  bool state;   // status stabil setelah filter
-  bool lastRaw; // pembacaan mentah terakhir
-  unsigned long changeTime;
-};
-
-Sensor sensorHasil = {SENSOR_HASIL, HIGH, HIGH, 0};
-Sensor sensorModal = {SENSOR_MODAL, HIGH, HIGH, 0};
-
-// =====================================================
-// HELPER COUNTER
-// =====================================================
-void bacaCounter(unsigned long &hasil, unsigned long &modal)
-{
-  portENTER_CRITICAL(&counterMux);
-  hasil = jumlahHasil;
-  modal = jumlahModal;
-  portEXIT_CRITICAL(&counterMux);
-}
-
-void resetCounters(bool resetHasil, bool resetModal)
-{
-  portENTER_CRITICAL(&counterMux);
-  if (resetHasil)
-  {
-    jumlahHasil = 0;
-  }
-  if (resetModal)
-  {
-    jumlahModal = 0;
-  }
-  portEXIT_CRITICAL(&counterMux);
-
-  counterDirty = true;
-}
+SensorFilter filterHasil(SENSOR_ACTIVE, PRESS_STABLE_TIME, RELEASE_STABLE_TIME);
+SensorFilter filterModal(SENSOR_ACTIVE, PRESS_STABLE_TIME, RELEASE_STABLE_TIME);
 
 // =====================================================
 // LCD (hanya dipanggil dari networkTask dan setup)
 // =====================================================
-void lcdTulisBaris(uint8_t baris, const char *teks)
-{
-  char buf[LCD_COLUMNS + 1];
-
-  // "%-16s" = rata kiri, sisa kolom diisi spasi (menghapus sisa karakter lama)
-  snprintf(buf, sizeof(buf), "%-16s", teks);
-
-  lcd.setCursor(0, baris);
-  lcd.print(buf);
-}
 
 void updateLCD()
 {
-  unsigned long hasil;
-  unsigned long modal;
-  bacaCounter(hasil, modal);
+  const CounterSnapshot c = counters.snapshot();
 
-  // Baris 1: selalu tampil, tidak berkedip.
-  // Karakter terakhir: '*' = sedang menghitung, '-' = berhenti (menunggu START)
-  char baris1[LCD_COLUMNS + 1];
-  snprintf(baris1, sizeof(baris1), "M:%5lu H:%5lu%c", modal, hasil, hitungAktif ? '*' : '-');
-  lcdTulisBaris(0, baris1);
+  LcdState state;
+  state.hasil = c.hasil;
+  state.modal = c.modal;
+  state.counting = hitungAktif;
+  state.lanOk = netMonitor.isOnline();
+  state.mqttOk = mqtt.isConnected();
 
-  // Baris 2: bergantian antara nama mesin dan status jaringan
-  char baris2[LCD_COLUMNS + 1];
-
-  if (lcdMachinePage)
-  {
-    snprintf(baris2, sizeof(baris2), "MESIN:%s", namaMesin);
-  }
-  else
-  {
-    snprintf(
-        baris2,
-        sizeof(baris2),
-        "LAN:%s MQTT:%s",
-        lanOK ? "OK" : "NO",
-        mqttOK ? "OK" : "NO");
-  }
-
-  lcdTulisBaris(1, baris2);
+  lcdView.render(state);
 }
 
 void handleLCD()
 {
-  unsigned long now = millis();
-
-  if (now - lcdLastChange >= LCD_PAGE_INTERVAL)
+  if (lcdView.advancePageIfDue(millis()))
   {
-    lcdLastChange = now;
-    lcdMachinePage = !lcdMachinePage;
     updateLCD();
   }
-}
-
-// =====================================================
-// MQTT PUBLISH (hanya dipanggil dari networkTask)
-// =====================================================
-void publishCounters()
-{
-  unsigned long hasil;
-  unsigned long modal;
-  bacaCounter(hasil, modal);
-
-  char buffer[16];
-
-  snprintf(buffer, sizeof(buffer), "%lu", hasil);
-  client.publish(topicJumlah, buffer, true);
-
-  snprintf(buffer, sizeof(buffer), "%lu", modal);
-  client.publish(topicJumlah2, buffer, true);
-}
-
-// Status saklar hitung, retained: HMI yang baru tersambung langsung tahu
-void publishMode()
-{
-  client.publish(topicMode, hitungAktif ? "ON" : "OFF", true);
-}
-
-void publishIP()
-{
-  IPAddress ip = Ethernet.localIP();
-
-  char ipBuffer[20];
-  snprintf(
-      ipBuffer,
-      sizeof(ipBuffer),
-      "%u.%u.%u.%u",
-      ip[0],
-      ip[1],
-      ip[2],
-      ip[3]);
-
-  client.publish(topicIP, ipBuffer, true);
 }
 
 // =====================================================
 // MQTT CALLBACK (berjalan di dalam client.loop() -> networkTask)
 // Memakai char array, bukan String, agar memori tidak terfragmentasi.
 // =====================================================
-void mqttCallback(char *topic, byte *payload, unsigned int length)
+void handleCommand(Command command)
 {
-  char command[24];
-
-  unsigned int n = length < (sizeof(command) - 1) ? length : (sizeof(command) - 1);
-  memcpy(command, payload, n);
-  command[n] = '\0';
-
-  // Buang spasi/enter di ujung
-  while (n > 0 && isspace((unsigned char)command[n - 1]))
-  {
-    command[--n] = '\0';
-  }
-
   Serial.print("MQTT Command: ");
-  Serial.println(command);
+  Serial.println(CommandParser::name(command));
 
-  if (strcmp(command, "START") == 0)
+  switch (command)
   {
+  case Command::Start:
     // Nol-kan DULU, baru aktifkan: hitungan setelah ini tidak ikut terhapus
-    resetCounters(true, true);
+    counters.reset(true, true);
     hitungAktif = true;
     ackPesan = "START_OK";
     Serial.println("START: mulai menghitung dari 0");
-  }
-  else if (strcmp(command, "STOP") == 0)
-  {
+    break;
+
+  case Command::Stop:
     // Matikan DULU, baru nol-kan: tidak ada hitungan nyelip setelah nol
     hitungAktif = false;
-    resetCounters(true, true);
+    counters.reset(true, true);
     ackPesan = "STOP_OK";
     Serial.println("STOP: berhenti menghitung, angka 0");
-  }
-  else if (strcmp(command, "RESET_S1") == 0)
-  {
-    resetCounters(true, false);
+    break;
+
+  case Command::ResetHasil:
+    counters.reset(true, false);
     ackPesan = "RESET_OK";
     Serial.println("RESET HASIL");
-  }
-  else if (strcmp(command, "RESET_S2") == 0)
-  {
-    resetCounters(false, true);
+    break;
+
+  case Command::ResetModal:
+    counters.reset(false, true);
     ackPesan = "RESET_OK";
     Serial.println("RESET MODAL");
-  }
-  else if (strcmp(command, "RESET_ALL") == 0 || strcmp(command, "RESET") == 0)
-  {
-    resetCounters(true, true);
+    break;
+
+  case Command::ResetAll:
+    counters.reset(true, true);
     ackPesan = "RESET_OK";
     Serial.println("RESET SEMUA");
-  }
-  else if (strcmp(command, "RESTART_DEVICE") == 0)
-  {
+    break;
+
+  case Command::RestartDevice:
     Serial.println("RESTART ESP32...");
     delay(500);
     ESP.restart();
+    break;
+
+  case Command::Unknown:
+    break;
   }
 }
 
-// =====================================================
-// MQTT CONNECT
-// =====================================================
-bool connectMQTT()
+// Dipanggil sekali setiap MQTT berhasil tersambung.
+void publishKeadaanAwal()
 {
-  Serial.println("Menghubungkan MQTT...");
+  const CounterSnapshot c = counters.snapshot();
 
-  char clientID[32];
-  snprintf(
-      clientID,
-      sizeof(clientID),
-      "SandingKecil-%08lX",
-      (unsigned long)ESP.getEfuseMac());
+  char ip[20];
+  formatIp(netMonitor.localIp(), ip, sizeof(ip));
 
-  bool connected;
-
-  if (strlen(mqtt_user) > 0)
-  {
-    connected = client.connect(clientID, mqtt_user, mqtt_pass);
-  }
-  else
-  {
-    connected = client.connect(clientID);
-  }
-
-  if (connected)
-  {
-    Serial.println("MQTT CONNECTED");
-
-    mqttOK = true;
-
-    client.subscribe(topicPerintah);
-    client.publish(topicStatus, "ONLINE", true);
-
-    publishCounters();
-    publishMode(); // setelah restart: "OFF" -> HMI tahu sensor perlu START ulang
-    publishIP();
-
-    lastHeartbeat = millis();
-
-    updateLCD();
-    return true;
-  }
-
-  Serial.print("MQTT gagal, rc=");
-  Serial.println(client.state());
-
-  mqttOK = false;
-  updateLCD();
-  return false;
+  // Setelah restart, mode "OFF" -> HMI tahu sensor perlu START ulang.
+  mqtt.publishOnConnect(c.hasil, c.modal, hitungAktif, ip);
 }
 
 // =====================================================
@@ -380,82 +154,18 @@ bool connectMQTT()
 // lanOK = kabel terpasang DAN sudah punya IP
 // (kode lama hanya mengecek kabel)
 // =====================================================
-bool adaIP()
+
+void logNetEvent(NetEvent event)
 {
-  return (uint32_t)Ethernet.localIP() != 0;
-}
-
-void cekEthernet()
-{
-  if (Ethernet.linkStatus() != LinkON)
+  if (event == NetEvent::DhcpRetrySucceeded)
   {
-    lanOK = false;
-    return;
+    Serial.print("DHCP diulang, berhasil. IP: ");
+    Serial.println(Ethernet.localIP());
   }
-
-  if (!adaIP())
+  else if (event == NetEvent::DhcpRetryFailed)
   {
-    // Kabel terpasang tapi belum dapat IP: ulangi DHCP secara berkala
-    lanOK = false;
-
-    unsigned long now = millis();
-
-    if (now - lastDhcpTry >= DHCP_RETRY_INTERVAL)
-    {
-      lastDhcpTry = now;
-
-      Serial.println("Mengulang DHCP...");
-
-      // timeout dipendekkan agar LCD & MQTT tidak lama terhenti
-      if (Ethernet.begin(mac, 8000, 2000) != 0)
-      {
-        Serial.print("DHCP berhasil, IP: ");
-        Serial.println(Ethernet.localIP());
-        lanOK = true;
-      }
-    }
-    return;
+    Serial.println("DHCP diulang, gagal.");
   }
-
-  Ethernet.maintain();
-  lanOK = true;
-}
-
-// =====================================================
-// FILTER SENSOR
-// Mengembalikan true SATU KALI setiap ada hitungan baru.
-// =====================================================
-bool prosesSensor(Sensor &s)
-{
-  bool raw = digitalRead(s.pin);
-  unsigned long now = millis();
-
-  // Pembacaan mentah berubah: mulai hitung ulang waktu stabil
-  if (raw != s.lastRaw)
-  {
-    s.lastRaw = raw;
-    s.changeTime = now;
-  }
-
-  // Sensor aktif dan stabil cukup lama: hitung 1
-  if (raw == SENSOR_ACTIVE && s.state != SENSOR_ACTIVE)
-  {
-    if (now - s.changeTime >= PRESS_STABLE_TIME)
-    {
-      s.state = SENSOR_ACTIVE;
-      return true;
-    }
-  }
-  // Sensor lepas dan stabil cukup lama: siap menghitung lagi
-  else if (raw != SENSOR_ACTIVE && s.state == SENSOR_ACTIVE)
-  {
-    if (now - s.changeTime >= RELEASE_STABLE_TIME)
-    {
-      s.state = raw;
-    }
-  }
-
-  return false;
 }
 
 // =====================================================
@@ -483,7 +193,7 @@ void prosesTombolReset()
     {
       sudahDitangani = true;
       Serial.println("RESET BUTTON");
-      resetCounters(true, true);
+      counters.reset(true, true);
     }
     else if (raw == HIGH && sudahDitangani)
     {
@@ -504,38 +214,23 @@ void sensorTask(void *parameter)
   {
     // Filter SELALU dijalankan agar status sensor tetap sinkron,
     // walau saklar OFF. Hasilnya baru dipakai kalau saklar ON.
-    bool hasilBaru = prosesSensor(sensorHasil);
-    bool modalBaru = prosesSensor(sensorModal);
+    bool hasilBaru = filterHasil.update(digitalRead(SENSOR_HASIL), millis());
+    bool modalBaru = filterModal.update(digitalRead(SENSOR_MODAL), millis());
 
     if (hitungAktif)
     {
       if (hasilBaru)
       {
-        portENTER_CRITICAL(&counterMux);
-        jumlahHasil++;
-        portEXIT_CRITICAL(&counterMux);
-
-        counterDirty = true;
-
-        // Serial dipanggil DI LUAR critical section
-        unsigned long hasil, modal;
-        bacaCounter(hasil, modal);
+        counters.incrementHasil();
         Serial.print("HASIL +1 = ");
-        Serial.println(hasil);
+        Serial.println(counters.snapshot().hasil);
       }
 
       if (modalBaru)
       {
-        portENTER_CRITICAL(&counterMux);
-        jumlahModal++;
-        portEXIT_CRITICAL(&counterMux);
-
-        counterDirty = true;
-
-        unsigned long hasil, modal;
-        bacaCounter(hasil, modal);
+        counters.incrementModal();
         Serial.print("MODAL +1 = ");
-        Serial.println(modal);
+        Serial.println(counters.snapshot().modal);
       }
     }
 
@@ -563,75 +258,44 @@ void networkTask(void *parameter)
     if (now - lastEthCheck >= ETH_CHECK_INTERVAL)
     {
       lastEthCheck = now;
-      cekEthernet();
+      logNetEvent(netMonitor.update(now));
       updateLCD();
     }
 
     // -------------------------------------------------
     // MQTT
     // -------------------------------------------------
-    if (lanOK)
+    switch (mqtt.update(netMonitor.isOnline(), now))
     {
-      if (!client.connected())
-      {
-        mqttOK = false;
+    case MqttEvent::Connected:
+      Serial.println("MQTT CONNECTED");
+      publishKeadaanAwal();
+      updateLCD();
+      break;
 
-        if (now - lastMQTTReconnect >= MQTT_RECONNECT_INTERVAL)
-        {
-          lastMQTTReconnect = now;
-          connectMQTT();
-        }
-      }
-      else
-      {
-        mqttOK = true;
-        client.loop();
-      }
-    }
-    else
-    {
-      mqttOK = false;
+    case MqttEvent::ConnectFailed:
+      Serial.print("MQTT gagal, rc=");
+      Serial.println(mqtt.lastState());
+      updateLCD();
+      break;
 
-      // Jaringan putus: tutup koneksi lama agar tidak menggantung
-      if (client.connected())
-      {
-        client.disconnect();
-      }
+    case MqttEvent::None:
+      break;
     }
 
     // -------------------------------------------------
     // Ada perubahan counter dari sensorTask / reset / START / STOP
     // -------------------------------------------------
-    if (counterDirty)
+    if (counters.takeDirty())
     {
-      // Bendera dimatikan SEBELUM membaca counter, jadi
-      // hitungan yang masuk setelah ini tidak ada yang terlewat.
-      counterDirty = false;
-
-      if (client.connected())
+      if (mqtt.isConnected())
       {
-        publishCounters();
-
-        // Balasan ke HMI dikirim SETELAH angka dipublish, jadi saat HMI
-        // menerima "START_OK"/"STOP_OK", angka 0 sudah pasti sampai lebih dulu.
-        if (ackPesan != nullptr)
-        {
-          publishMode();
-          client.publish(topicAck, ackPesan, false);
-        }
+        const CounterSnapshot c = counters.snapshot();
+        mqtt.publishChange(c.hasil, c.modal, hitungAktif, ackPesan);
       }
 
       ackPesan = nullptr;
       updateLCD();
-    }
-
-    // -------------------------------------------------
-    // Heartbeat (timer sendiri, terpisah dari cek Ethernet)
-    // -------------------------------------------------
-    if (client.connected() && (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL))
-    {
-      lastHeartbeat = millis();
-      client.publish(topicStatus, "ONLINE", true);
     }
 
     // -------------------------------------------------
@@ -649,6 +313,17 @@ void networkTask(void *parameter)
 void setup()
 {
   Serial.begin(115200);
+
+  // MAC & Client ID
+  if (!identity.begin())
+  {
+    Serial.println("PERINGATAN: MAC perangkat tidak valid, jaringan mungkin gagal.");
+  }
+  Serial.print("MAC: ");
+  Serial.println(identity.macText());
+  Serial.print("Client ID: ");
+  Serial.println(identity.clientId());
+
   delay(500);
 
   Serial.println();
@@ -663,20 +338,12 @@ void setup()
   pinMode(RESET_BUTTON, INPUT_PULLUP);
 
   // Kondisi awal sensor
-  sensorHasil.state = digitalRead(SENSOR_HASIL);
-  sensorHasil.lastRaw = sensorHasil.state;
-
-  sensorModal.state = digitalRead(SENSOR_MODAL);
-  sensorModal.lastRaw = sensorModal.state;
+  filterHasil.begin(digitalRead(SENSOR_HASIL), millis());
+  filterModal.begin(digitalRead(SENSOR_MODAL), millis());
 
   // LCD
-  Wire.begin();
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
-
-  lcdTulisBaris(0, "SANDING KECIL");
-  lcdTulisBaris(1, "STARTING...");
+  lcdView.begin();
+  lcdView.showMessage("SANDING KECIL", "STARTING...");
   delay(1500);
 
   // SPI + ENC28J60
@@ -686,26 +353,27 @@ void setup()
   // DHCP (jika gagal, networkTask akan mengulang otomatis)
   Serial.println("Memulai DHCP...");
 
-  if (Ethernet.begin(mac, 8000, 2000) == 0)
+  if (netMonitor.start())
   {
-    Serial.println("DHCP gagal, akan dicoba lagi otomatis.");
-    lanOK = false;
-  }
-  else
-  {
-    lanOK = true;
     Serial.print("DHCP berhasil, IP: ");
     Serial.println(Ethernet.localIP());
   }
+  else
+  {
+    Serial.println("DHCP gagal, akan dicoba lagi otomatis.");
+  }
 
   // MQTT
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqttCallback);
-  client.setSocketTimeout(3); // detik; agar koneksi gagal tidak menahan task lama
+  MqttSettings mqttSettings{};
+  snprintf(mqttSettings.clientId, sizeof(mqttSettings.clientId), "%s", identity.clientId());
+  mqttSettings.user = mqtt_user;
+  mqttSettings.pass = mqtt_pass;
+  mqttSettings.useLastWill = MQTT_USE_LAST_WILL;
+  mqtt.begin(mqttSettings);
+  mqtt.onCommand(handleCommand);
 
   // LCD awal
-  lcdMachinePage = false;
-  lcdLastChange = millis();
+  lcdView.restartPageTimer(millis());
   updateLCD();
 
   // Task sensor di core 0
