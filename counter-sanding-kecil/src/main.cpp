@@ -1,4 +1,3 @@
-#include "secrets.h"
 #include "sanding_config.h"
 #include "sensor_filter.h"
 #include "counter_store.h"
@@ -12,11 +11,28 @@
 #include "i2c_lcd_display.h"
 #include "device_identity.h"
 #include "esp_mac_source.h"
+#include "device_config.h"
+#include "console_shell.h"
+#include "nvs_config_store.h"
+#include "firmware_info.h"
+#include "build_info.h"
 
 using namespace config;
 
+// NVS Configuration store (dipakai oleh console shell)
+NvsConfigStore configStore;
+ConfigManager configManager(configStore, config::namaMesin, config::MQTT_DEFAULT_PORT);
+DeviceConfig deviceConfig; // diisi sekali di setup(), sesudahnya hanya dibaca
+
+ConsoleShell serialConsole(
+    configManager,
+    [](const char *baris)
+    { Serial.println(baris); },
+    []()
+    { delay(300); ESP.restart(); });
+
 I2cLcdDisplay lcdDisplay;
-LcdView lcdView(lcdDisplay, namaMesin, LCD_PAGE_INTERVAL);
+LcdView lcdView(lcdDisplay, deviceConfig.machineName, LCD_PAGE_INTERVAL);
 
 EspMacSource macSource;
 DeviceIdentity identity(macSource, config::clientIdPrefix);
@@ -24,7 +40,7 @@ EncDriver encDriver(identity);
 NetMonitor netMonitor(encDriver, DHCP_RETRY_INTERVAL);
 
 EthernetClient ethClient;
-PubSubMqttClient mqttClient(ethClient, mqtt_server, mqtt_port);
+PubSubMqttClient mqttClient(ethClient);
 MqttService mqtt(mqttClient);
 
 // =====================================================
@@ -32,6 +48,9 @@ MqttService mqtt(mqttClient);
 // =====================================================
 EspSpinLock counterLock;
 CounterStore counters(counterLock);
+
+// Firmware version (dipakai di MQTT Last Will)
+FirmwareInfo firmwareInfo(FW_VERSION, FW_BUILD);
 
 // =====================================================
 // SAKLAR HITUNG
@@ -147,6 +166,11 @@ void publishKeadaanAwal()
 
   // Setelah restart, mode "OFF" -> HMI tahu sensor perlu START ulang.
   mqtt.publishOnConnect(c.hasil, c.modal, hitungAktif, ip);
+
+  // Versi firmware sebagai JSON, retained. Dipanggil sekali setiap MQTT tersambung.
+  char versi[FirmwareInfo::JSON_SIZE];
+  firmwareInfo.toJson(versi, sizeof(versi));
+  mqtt.publishVersion(versi);
 }
 
 // =====================================================
@@ -314,6 +338,15 @@ void setup()
 {
   Serial.begin(115200);
 
+  configStore.begin();
+  const int tidakValid = configManager.load(deviceConfig);
+  if (tidakValid > 0)
+  {
+    Serial.print("PERINGATAN: ");
+    Serial.print(tidakValid);
+    Serial.println(" nilai konfigurasi tidak valid, memakai nilai bawaan.");
+  }
+
   // MAC & Client ID
   if (!identity.begin())
   {
@@ -331,6 +364,13 @@ void setup()
   Serial.println("SANDING KECIL");
   Serial.println("ESP32 + ENC28J60");
   Serial.println("==============================");
+
+  // Firmware version
+  Serial.print("Versi: ");
+  Serial.print(firmwareInfo.version());
+  Serial.print(" (build ");
+  Serial.print(firmwareInfo.build());
+  Serial.println(")");
 
   // Pin sensor & tombol
   pinMode(SENSOR_HASIL, INPUT_PULLUP);
@@ -364,13 +404,21 @@ void setup()
   }
 
   // MQTT
+  mqttClient.setServer(deviceConfig.mqttHost, deviceConfig.mqttPort);
+
   MqttSettings mqttSettings{};
   snprintf(mqttSettings.clientId, sizeof(mqttSettings.clientId), "%s", identity.clientId());
-  mqttSettings.user = mqtt_user;
-  mqttSettings.pass = mqtt_pass;
+  mqttSettings.user = deviceConfig.mqttUser;
+  mqttSettings.pass = deviceConfig.mqttPass;
   mqttSettings.useLastWill = MQTT_USE_LAST_WILL;
+  mqttSettings.enabled = ConfigManager::isComplete(deviceConfig);
   mqtt.begin(mqttSettings);
   mqtt.onCommand(handleCommand);
+
+  if (!mqttSettings.enabled)
+  {
+    Serial.println("MQTT dinonaktifkan: mqtt_host belum diisi. Ketik 'help' di Serial Monitor.");
+  }
 
   // LCD awal
   lcdView.restartPageTimer(millis());
@@ -405,5 +453,9 @@ void setup()
 // =====================================================
 void loop()
 {
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  while (Serial.available() > 0)
+  {
+    serialConsole.feed((char)Serial.read());
+  }
+  vTaskDelay(pdMS_TO_TICKS(20));
 }

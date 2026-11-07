@@ -83,6 +83,7 @@ static MqttSettings buatSettings(const char *user = "", bool lastWill = false)
     s.user = user;
     s.pass = "rahasia";
     s.useLastWill = lastWill;
+    s.enabled = true;
     return s;
 }
 
@@ -286,6 +287,29 @@ void test_perintah_masuk_tanpa_handler_tidak_crash()
     TEST_ASSERT_TRUE(true);
 }
 
+void test_tidak_aktif_tidak_pernah_menyambung()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    MqttSettings s = buatSettings();
+    s.enabled = false;
+    m.begin(s);
+    TEST_ASSERT_EQUAL(ev(MqttEvent::None), ev(m.update(true, 1000)));
+    TEST_ASSERT_EQUAL(0, f.connectCalls);
+}
+
+void test_publishVersion_retained_ke_topic_versi()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    m.publishVersion("{\"version\":\"v1\",\"build\":1}");
+    TEST_ASSERT_EQUAL(1, (int)f.terbit.size());
+    TEST_ASSERT_EQUAL_STRING(config::topicVersi, f.terbit[0].topic.c_str());
+    TEST_ASSERT_EQUAL_STRING("{\"version\":\"v1\",\"build\":1}", f.terbit[0].payload.c_str());
+    TEST_ASSERT_TRUE(f.terbit[0].retain);
+}
+
 int main()
 {
     UNITY_BEGIN();
@@ -302,5 +326,7 @@ int main()
     RUN_TEST(test_publishChange_dengan_ack_angka_dulu_lalu_mode_lalu_ack_tidak_retained);
     RUN_TEST(test_perintah_masuk_diparse_dan_diteruskan_ke_handler);
     RUN_TEST(test_perintah_masuk_tanpa_handler_tidak_crash);
+    RUN_TEST(test_tidak_aktif_tidak_pernah_menyambung);
+    RUN_TEST(test_publishVersion_retained_ke_topic_versi);
     return UNITY_END();
 }

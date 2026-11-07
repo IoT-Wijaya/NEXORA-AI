@@ -27,6 +27,9 @@ bool MqttService::isConnected() { return client_.connected(); }
 
 MqttEvent MqttService::update(bool networkOnline, uint32_t nowMs)
 {
+    if (!settings_.enabled)
+        return MqttEvent::None;
+
     if (!networkOnline)
     {
         // Jaringan putus: tutup koneksi lama agar tidak menggantung.
@@ -112,4 +115,9 @@ void MqttService::publishNumber(const char *topic, uint32_t value)
 void MqttService::publishMode(bool aktif)
 {
     client_.publish(config::topicMode, aktif ? "ON" : "OFF", true);
+}
+
+void MqttService::publishVersion(const char *json)
+{
+    client_.publish(config::topicVersi, json, true);
 }

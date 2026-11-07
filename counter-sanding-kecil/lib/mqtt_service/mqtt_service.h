@@ -10,6 +10,7 @@ struct MqttSettings
     const char *user; // nullptr atau "" = tanpa autentikasi
     const char *pass;
     bool useLastWill;
+    bool enabled;
 };
 
 enum class MqttEvent
@@ -46,6 +47,9 @@ public:
     // ack, mode dan ack menyusul, sehingga HMI yang menerima ack pasti sudah
     // menerima angkanya.
     void publishChange(uint32_t hasil, uint32_t modal, bool aktif, const char *ack);
+
+    // Versi firmware sebagai JSON, retained. Dipanggil sekali setiap MQTT tersambung.
+    void publishVersion(const char *json);
 
 private:
     MqttEvent tryConnect(uint32_t nowMs);

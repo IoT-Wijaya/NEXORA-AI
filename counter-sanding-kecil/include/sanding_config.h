@@ -35,6 +35,7 @@ namespace config
     constexpr bool SENSOR_ACTIVE = false; // aktif LOW
 
     // ---- Waktu (ms) ----
+    constexpr uint16_t MQTT_DEFAULT_PORT = 1883;
     constexpr unsigned long PRESS_STABLE_TIME = 100;
     constexpr unsigned long RELEASE_STABLE_TIME = 400;
     constexpr unsigned long RESET_DEBOUNCE_TIME = 50;
@@ -54,6 +55,7 @@ namespace config
     constexpr const char *topicIP = TOPIC_BASE "ip";
     constexpr const char *topicPerintah = TOPIC_BASE "perintah";
     constexpr const char *topicAck = TOPIC_BASE "ack";
+    constexpr const char *topicVersi = TOPIC_BASE "versi";
     constexpr const char *topicMode = TOPIC_BASE "mode";
 
     constexpr unsigned long DHCP_TIMEOUT_MS = 8000;
