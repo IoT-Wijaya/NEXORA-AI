@@ -16,6 +16,7 @@
 #include "nvs_config_store.h"
 #include "firmware_info.h"
 #include "build_info.h"
+#include "partition_log.h"
 
 using namespace config;
 
@@ -367,6 +368,7 @@ void setup()
 
   // Firmware version
   Serial.print("Versi: ");
+  logPartitions();
   Serial.print(firmwareInfo.version());
   Serial.print(" (build ");
   Serial.print(firmwareInfo.build());

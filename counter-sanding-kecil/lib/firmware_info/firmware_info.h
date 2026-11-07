@@ -6,8 +6,8 @@
 class FirmwareInfo
 {
 public:
-    static constexpr size_t MAX_VERSION_LEN = 39;
-    static constexpr size_t JSON_SIZE = 80; // cukup untuk versi terpanjang dan build 10 digit
+    static constexpr size_t MAX_VERSION_LEN = 63;
+    static constexpr size_t JSON_SIZE = 100; // cukup untuk versi terpanjang dan build 10 digit
 
     FirmwareInfo(const char *version, uint32_t build);
 

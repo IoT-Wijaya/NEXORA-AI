@@ -42,17 +42,19 @@ void test_karakter_yang_diizinkan_dipertahankan()
     TEST_ASSERT_EQUAL_STRING("v1.4.0-3-gabc123+x_y", FirmwareInfo("v1.4.0-3-gabc123+x_y", 1).version());
 }
 
-void test_versi_dari_git_describe_yang_umum_utuh()
+void test_versi_dari_git_describe_dengan_dirty_utuh()
 {
-    TEST_ASSERT_EQUAL_STRING("baseline-refactor-12-gabc1234-dirty",
-                             FirmwareInfo("baseline-refactor-12-gabc1234-dirty", 0).version());
+    TEST_ASSERT_EQUAL_STRING("input-display-v2026.11.1.1-6-gb4e7f4b-dirty",
+                             FirmwareInfo("input-display-v2026.11.1.1-6-gb4e7f4b-dirty", 0).version());
 }
 
 void test_versi_terlalu_panjang_dipotong_dan_json_tetap_utuh()
 {
-    const char panjang[] = "v1.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    char panjang[81];
+    memset(panjang, 'a', 80);
+    panjang[80] = '\0';
     FirmwareInfo f(panjang, 4294967295UL);
-    TEST_ASSERT_EQUAL(39, (int)strlen(f.version()));
+    TEST_ASSERT_EQUAL(63, (int)strlen(f.version()));
     char b[FirmwareInfo::JSON_SIZE];
     f.toJson(b, sizeof(b));
     const size_t n = strlen(b);
@@ -76,7 +78,7 @@ int main()
     RUN_TEST(test_versi_kosong_atau_null_menjadi_unknown);
     RUN_TEST(test_karakter_tidak_diizinkan_diganti_garis_bawah);
     RUN_TEST(test_karakter_yang_diizinkan_dipertahankan);
-    RUN_TEST(test_versi_dari_git_describe_yang_umum_utuh);
+    RUN_TEST(test_versi_dari_git_describe_dengan_dirty_utuh);
     RUN_TEST(test_versi_terlalu_panjang_dipotong_dan_json_tetap_utuh);
     RUN_TEST(test_buffer_json_kecil_tetap_aman);
     return UNITY_END();
