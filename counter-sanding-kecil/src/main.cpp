@@ -17,6 +17,9 @@
 #include "firmware_info.h"
 #include "build_info.h"
 #include "partition_log.h"
+#include "ota_state_machine.h"
+#include "blob_ota_store.h"
+#include "nvs_blob_store.h"
 
 using namespace config;
 
@@ -52,6 +55,16 @@ CounterStore counters(counterLock);
 
 // Firmware version (dipakai di MQTT Last Will)
 FirmwareInfo firmwareInfo(FW_VERSION, FW_BUILD);
+
+// =====================================================
+// OTA STATE MACHINE (dibagi antar task, selalu diakses lewat mutex)
+// =====================================================
+NvsBlobStore otaBlobStore("ota");
+BlobOtaStore otaStore(otaBlobStore, "state");
+OtaStateMachine otaMachine(
+    otaStore,
+    OtaConfig{OTA_MAX_PENDING_BOOTS, OTA_MAX_REQUEST_ATTEMPTS, OTA_MAX_ROLLBACK_ATTEMPTS,
+              OTA_HEALTH_DEADLINE_MS});
 
 // =====================================================
 // SAKLAR HITUNG
@@ -368,7 +381,28 @@ void setup()
 
   // Firmware version
   Serial.print("Versi: ");
+  Serial.print(firmwareInfo.version());
+  Serial.print(" (build ");
+  Serial.print(firmwareInfo.build());
+  Serial.println(")");
+
   logPartitions();
+
+  // Catatan OTA
+  otaBlobStore.begin();
+  OtaRecord catatanOta;
+  Serial.println(otaStore.load(catatanOta) ? "OTA: catatan ditemukan"
+                                           : "OTA: catatan belum ada atau rusak, dibuat baru");
+
+  const BootAction aksiBoot = otaMachine.onBoot(firmwareInfo.build(), millis());
+  Serial.print("OTA: state=");
+  Serial.print(otaStateCode(otaMachine.state()));
+  Serial.print(", aksi boot=");
+  Serial.println(bootActionCode(aksiBoot));
+  if (aksiBoot != BootAction::Normal)
+  {
+    Serial.println("PERINGATAN: aksi OTA ini belum didukung firmware ini.");
+  }
   Serial.print(firmwareInfo.version());
   Serial.print(" (build ");
   Serial.print(firmwareInfo.build());

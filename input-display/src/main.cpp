@@ -5,7 +5,7 @@
 #include <EthernetUdp.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
-#include "config.h"
+#include "display_config.h"
 #include <Preferences.h>
 #include <Update.h>
 #include "mbedtls/sha256.h"

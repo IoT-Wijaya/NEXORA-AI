@@ -48,6 +48,14 @@ namespace config
     constexpr bool MQTT_USE_LAST_WILL = false;
     static_assert(HEARTBEAT_INTERVAL < 15000UL, "Laravel menganggap OFFLINE jika tidak ada pesan lebih dari 15 detik");
 
+    // ---- OTA ----
+    constexpr uint8_t OTA_MAX_PENDING_BOOTS = 3;               // boot tanpa konfirmasi sebelum rollback
+    constexpr uint8_t OTA_MAX_REQUEST_ATTEMPTS = 3;            // percobaan unduh sebelum menyerah
+    constexpr uint8_t OTA_MAX_ROLLBACK_ATTEMPTS = 3;           // percobaan rollback sebelum mengaku gagal
+    constexpr unsigned long OTA_HEALTH_DEADLINE_MS = 180000UL; // 3 menit
+    static_assert(OTA_HEALTH_DEADLINE_MS >= 60000UL && OTA_HEALTH_DEADLINE_MS <= 600000UL,
+                  "batas waktu pembuktian sehat harus antara 1 dan 10 menit");
+
     // ---- Topic MQTT ----
     constexpr const char *topicStatus = TOPIC_BASE "status";
     constexpr const char *topicJumlah = TOPIC_BASE "jumlah";

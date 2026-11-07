@@ -3,7 +3,7 @@ import os
 import re
 import subprocess
 
-MAKS_PANJANG = 39
+MAKS_PANJANG = 63
 
 
 def git(*args):
