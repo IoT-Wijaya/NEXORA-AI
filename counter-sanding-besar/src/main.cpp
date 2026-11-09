@@ -6,8 +6,10 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
-#include "config.h"
 #include "secrets.h"
+#include "sanding_besar.h"
+
+using namespace config;
 // =====================================================
 // SANDING BESAR - ESP32 + W5500 + LCD 20x4 + MQTT VPS
 // -----------------------------------------------------
@@ -31,40 +33,12 @@
 // =====================================================
 // KONFIGURASI LCD 20x4
 // =====================================================
-#define LCD_ADDRESS 0x27
-#define LCD_COLUMNS 20
-#define LCD_ROWS 4
-
 LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
-
-// =====================================================
-// KONFIGURASI W5500
-// =====================================================
-#define W5500_CS_PIN 5
-#define W5500_SCK_PIN 18
-#define W5500_MISO_PIN 19
-#define W5500_MOSI_PIN 23
-
-// Pin RST modul W5500 (opsional). Isi nomor GPIO (misalnya 4) jika kabel
-// RST disambung, atau biarkan -1 jika tidak (hanya init ulang lewat kode).
-#define W5500_RST_PIN -1
 
 // MAC harus UNIK di jaringan. Sanding Kecil memakai ...FE:02.
 byte mac[] = DEVICE_MAC;
 EthernetClient ethClient;
 PubSubClient client(ethClient);
-
-// Topik sama dengan kode lama (dashboard tidak perlu diubah)
-#define TOPIC_BASE "pabrik/veneer/"
-
-const char *topicStatus = TOPIC_BASE "status";
-const char *topicJumlah = TOPIC_BASE "jumlah";   // Hasil
-const char *topicJumlah2 = TOPIC_BASE "jumlah2"; // Modal
-const char *topicIP = TOPIC_BASE "ip";
-const char *topicPerintah = TOPIC_BASE "perintah";
-const char *topicDiag = TOPIC_BASE "diag"; // laporan diagnosa lengkap (JSON)
-const char *topicAck = TOPIC_BASE "ack";
-const char *topicMode = TOPIC_BASE "mode";
 
 volatile bool hitungAktif = false;
 volatile uint8_t cmdTertunda = 0;
@@ -74,44 +48,8 @@ volatile uint8_t cmdTertunda = 0;
 
 #define FW_VERSION "2026.10.17"
 
-// =====================================================
-// PIN
-// =====================================================
-#define SENSOR_HASIL 27 // Sensor Hasil Sanding Besar
-#define SENSOR_MODAL 32 // Sensor Modal Sanding Otomatis
-#define RESET_BUTTON 0  // GPIO0 = tombol BOOT, jangan ditahan saat menyalakan
-
 // Sensor aktif LOW
 #define SENSOR_ACTIVE LOW
-
-// =====================================================
-// WAKTU (ms)
-// =====================================================
-const unsigned long PRESS_STABLE_TIME = 100;
-const unsigned long RELEASE_STABLE_TIME = 400;
-const unsigned long RESET_DEBOUNCE_TIME = 50;
-
-const unsigned long ETH_CHECK_INTERVAL = 3000UL;
-const unsigned long DHCP_RETRY_INTERVAL = 15000UL;
-
-// Backoff reconnect MQTT: mulai 2 detik, dobel tiap gagal, maks 60 detik
-const unsigned long MQTT_RETRY_MIN = 2000UL;
-const unsigned long MQTT_RETRY_MAX = 60000UL;
-
-// Harus JAUH di bawah 15 detik: dashboard menganggap OFFLINE
-// jika tidak ada pesan lebih dari 15 detik.
-const unsigned long HEARTBEAT_INTERVAL = 5000UL;
-
-// Pemulihan bertingkat (dihitung sejak kabel ON tapi MQTT belum OK)
-const unsigned long RESET_ETH_AFTER = 5UL * 60UL * 1000UL;
-const unsigned long RESTART_AFTER = 10UL * 60UL * 1000UL;
-
-// Kabel dianggap putus setelah N pengecekan berturut-turut (N x 3 detik)
-const uint8_t LINK_OFF_CONFIRM = 2;
-
-// Laporan ke Serial Monitor dan ke dashboard (topik diag)
-const unsigned long REPORT_INTERVAL = 60000UL;
-const unsigned long DIAG_INTERVAL = 60000UL;
 
 // Watchdog: task yang tidak "lapor hidup" selama ini -> ESP32 restart
 const uint32_t WDT_TIMEOUT_S = 60;
