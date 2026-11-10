@@ -20,6 +20,11 @@
 #include "ota_state_machine.h"
 #include "blob_ota_store.h"
 #include "nvs_blob_store.h"
+#include "ethernet_http_transport.h"
+#include "esp_ota_flash.h"
+#include "arduino_clock.h"
+#include "ota_runner.h"
+#include "ota_public_key.h"
 
 using namespace config;
 
@@ -346,6 +351,42 @@ void networkTask(void *parameter)
 }
 
 // =====================================================
+// UJI KERING OTA (SEMENTARA, hanya bila -DOTA_DRY_RUN_ON_BOOT)
+// Dijalankan di setup() SEBELUM task dibuat, jadi hanya satu thread yang
+// memakai Ethernet. Mengunduh manifest + firmware ke slot cadangan dan
+// memverifikasinya, TANPA mengalihkan slot boot.
+// =====================================================
+#ifdef OTA_DRY_RUN_ON_BOOT
+void jalankanOtaDryRun()
+{
+  EthernetHttpTransport transport;
+  EspOtaFlash flash;
+  ArduinoClock jam;
+  OtaRunner runner(transport, flash, jam, [](const char *baris)
+                   { Serial.println(baris); });
+
+  const esp_partition_t *slotBerikut = esp_ota_get_next_update_partition(nullptr);
+
+  OtaRunConfig cfg;
+  cfg.host = OTA_HOST;
+  cfg.port = OTA_PORT;
+  cfg.manifestPath = OTA_MANIFEST_PATH;
+  cfg.firmwarePath = OTA_FIRMWARE_PATH;
+  cfg.publicKey = ota::SIGNING_PUBLIC_KEY;
+  cfg.dryRun = true;
+  cfg.profile = DeviceProfile{OTA_DEVICE_TYPE, OTA_BOARD, static_cast<uint32_t>(firmwareInfo.build()),
+                              slotBerikut != nullptr ? slotBerikut->size : 0};
+  cfg.overallTimeoutMs = OTA_OVERALL_TIMEOUT_MS;
+
+  const OtaRunOutcome hasil = runner.run(cfg);
+  Serial.print("OTA DRY RUN: ");
+  Serial.print(otaRunResultCode(hasil.result));
+  Serial.print(" - ");
+  Serial.println(hasil.detail);
+}
+#endif
+
+// =====================================================
 // SETUP
 // =====================================================
 void setup()
@@ -438,6 +479,17 @@ void setup()
   {
     Serial.println("DHCP gagal, akan dicoba lagi otomatis.");
   }
+
+#ifdef OTA_DRY_RUN_ON_BOOT
+  if (netMonitor.isOnline())
+  {
+    jalankanOtaDryRun();
+  }
+  else
+  {
+    Serial.println("OTA DRY RUN dilewati: LAN belum online.");
+  }
+#endif
 
   // MQTT
   mqttClient.setServer(deviceConfig.mqttHost, deviceConfig.mqttPort);

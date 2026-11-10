@@ -53,6 +53,14 @@ namespace config
     constexpr uint8_t OTA_MAX_REQUEST_ATTEMPTS = 3;            // percobaan unduh sebelum menyerah
     constexpr uint8_t OTA_MAX_ROLLBACK_ATTEMPTS = 3;           // percobaan rollback sebelum mengaku gagal
     constexpr unsigned long OTA_HEALTH_DEADLINE_MS = 180000UL; // 3 menit
+    // Batas waktu pembuktian sehat harus antara 1 dan 10 menit`
+    constexpr const char *OTA_HOST = "monitoring.wijayaplywoods.com";
+    constexpr uint16_t OTA_PORT = 80;
+    constexpr const char *OTA_MANIFEST_PATH = "/fw/manifest.signed";
+    constexpr const char *OTA_FIRMWARE_PATH = "/fw/firmware.bin";
+    constexpr const char *OTA_DEVICE_TYPE = "sanding-kecil";
+    constexpr const char *OTA_BOARD = "nodemcu-32s";
+    constexpr uint32_t OTA_OVERALL_TIMEOUT_MS = 600000UL;
     static_assert(OTA_HEALTH_DEADLINE_MS >= 60000UL && OTA_HEALTH_DEADLINE_MS <= 600000UL,
                   "batas waktu pembuktian sehat harus antara 1 dan 10 menit");
 

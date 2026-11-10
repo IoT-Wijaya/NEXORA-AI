@@ -518,6 +518,52 @@ void test_millis_berputar_tidak_merusak_batas_waktu()
     TEST_ASSERT_TRUE(s.got == FW);
 }
 
+void test_ukuran_tidak_diketahui_diterima_selama_di_bawah_batas()
+{
+    FakeTransport t;
+    FakeSink s;
+    Conn c;
+    c.data = response("200 OK", FW);
+    t.script.push_back(c);
+    FirmwareDownloader d(t, s);
+    DownloadConfig c2 = cfg();
+    c2.expectedSize = 0;
+    c2.maxSize = static_cast<uint32_t>(FW.size()); // tepat di batas: diterima
+    d.start(c2, 0);
+    run(d);
+    TEST_ASSERT_EQUAL(DownloadState::Done, d.state());
+    TEST_ASSERT_TRUE(s.got == FW);
+}
+
+void test_ukuran_tidak_diketahui_ditolak_bila_melebihi_batas()
+{
+    FakeTransport t;
+    FakeSink s;
+    Conn c;
+    c.data = response("200 OK", FW);
+    t.script.push_back(c);
+    FirmwareDownloader d(t, s);
+    DownloadConfig c2 = cfg();
+    c2.expectedSize = 0;
+    c2.maxSize = static_cast<uint32_t>(FW.size() - 1);
+    d.start(c2, 0);
+    run(d);
+    TEST_ASSERT_EQUAL(DownloadFailure::SizeMismatch, d.failure());
+    TEST_ASSERT_EQUAL(0, s.got.size());
+}
+
+void test_tanpa_ukuran_dan_tanpa_batas_adalah_konfigurasi_salah()
+{
+    FakeTransport t;
+    FakeSink s;
+    FirmwareDownloader d(t, s);
+    DownloadConfig c2 = cfg();
+    c2.expectedSize = 0;
+    c2.maxSize = 0;
+    d.start(c2, 0);
+    TEST_ASSERT_EQUAL(DownloadFailure::BadConfig, d.failure());
+}
+
 int main()
 {
     UNITY_BEGIN();
@@ -542,5 +588,8 @@ int main()
     RUN_TEST(test_abort_menutup_koneksi);
     RUN_TEST(test_setelah_selesai_step_tidak_berbuat_apa_apa);
     RUN_TEST(test_millis_berputar_tidak_merusak_batas_waktu);
+    RUN_TEST(test_ukuran_tidak_diketahui_diterima_selama_di_bawah_batas);
+    RUN_TEST(test_ukuran_tidak_diketahui_ditolak_bila_melebihi_batas);
+    RUN_TEST(test_tanpa_ukuran_dan_tanpa_batas_adalah_konfigurasi_salah);
     return UNITY_END();
 }

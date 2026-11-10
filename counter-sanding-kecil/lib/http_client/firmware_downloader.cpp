@@ -65,7 +65,7 @@ void FirmwareDownloader::start(const DownloadConfig &config, uint32_t nowMs)
     retryAt_ = 0;
     lastActivity_ = nowMs;
     failures_ = 0;
-    if (config_.host == nullptr || config_.path == nullptr || config_.expectedSize == 0 ||
+    if (config_.host == nullptr || config_.path == nullptr || (config_.expectedSize == 0 && config_.maxSize == 0) ||
         config_.maxFailuresWithoutProgress == 0)
     {
         fail(DownloadFailure::BadConfig);
@@ -204,8 +204,12 @@ void FirmwareDownloader::onHeaderDone(uint32_t now)
         fail(DownloadFailure::BadResponse);
         return;
     }
-    // Total yang akan kita miliki harus persis sama dengan ukuran di manifest.
-    if (static_cast<uint64_t>(received_) + plan.bodyLength != config_.expectedSize)
+    // Total yang akan kita miliki harus persis sama dengan ukuran di manifest,
+    // atau (bila ukuran belum diketahui) tidak melebihi batas maxSize.
+    const uint64_t total = static_cast<uint64_t>(received_) + plan.bodyLength;
+    const bool sizeOk = config_.expectedSize != 0 ? total == config_.expectedSize
+                                                  : total <= config_.maxSize;
+    if (!sizeOk)
     {
         fail(DownloadFailure::SizeMismatch);
         return;

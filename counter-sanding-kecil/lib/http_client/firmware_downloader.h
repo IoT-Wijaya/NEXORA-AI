@@ -34,7 +34,10 @@ struct DownloadConfig
     const char *host = nullptr; // pointer harus hidup selama unduhan
     uint16_t port = 80;
     const char *path = nullptr;
-    uint32_t expectedSize = 0; // dari manifest bertanda tangan
+    // Ukuran PERSIS yang diharapkan (dari manifest bertanda tangan), atau 0 bila
+    // belum diketahui; dalam kasus 0, maxSize wajib diisi (mis. untuk mengunduh manifest).
+    uint32_t expectedSize = 0;
+    uint32_t maxSize = 0; // batas atas bila expectedSize == 0
     uint8_t maxFailuresWithoutProgress = 5;
     uint32_t retryDelayMs = 2000;
     uint32_t stallTimeoutMs = 15000;
