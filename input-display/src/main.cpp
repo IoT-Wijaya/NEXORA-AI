@@ -18,20 +18,10 @@
 
 volatile bool otaDiminta = false;
 
-const char *topicMasuk = "pabrik/veneer/jumlah";
-const char *topicKeluar = "pabrik/veneer/jumlah2";
-const char *topicRefresh = "pabrik/veneer/refresh";
-const char *topicPerintah = "pabrik/veneer/perintah";
-const char *topicAck = "pabrik/veneer/ack";
-const char *topicMode = "pabrik/veneer/mode";
-
 // =====================================================
 //  KONFIGURASI ETHERNET W5500 (SPI: SCK=18, MISO=23, MOSI=19, CS=16)
 // =====================================================
 byte mac[6];
-
-const int ETHERNET_CS_PIN = 16;
-
 // =====================================================
 //  PENGATURAN AUTO UPDATE
 //  Polling dijarangkan: MQTT topik "refresh" sudah memicu ambil data.
@@ -303,16 +293,6 @@ const bool IZINKAN_BATAL_TAHAN = true;
 const unsigned long TAHAN_BATAL_MS = 3000; // tahan BACK sekian ms untuk batal
 unsigned long backTahanMulai = 0;
 
-// =====================================================
-//  PEMANTAUAN JARINGAN (LAN, MQTT, HTTP) KE DASHBOARD
-// =====================================================
-#define TOPIC_HMI "pabrik/hmi_sanding/" // ganti sesuai kebutuhan
-const char *topicHmiStatus = TOPIC_HMI "status";
-const char *topicHmiIP = TOPIC_HMI "ip";
-const char *topicHmiDiag = TOPIC_HMI "diag";
-const char *topicHmiPerintah = TOPIC_HMI "perintah";
-const char *topicHmiOta = TOPIC_HMI "ota";
-const char *topicHmiAktif = TOPIC_HMI "aktif"; // item yang sedang di-sanding (retained; kosong = tidak ada)
 bool otaManual = false;
 
 const unsigned long ETH_CHECK_INTERVAL = 3000UL;

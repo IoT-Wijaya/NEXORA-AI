@@ -26,12 +26,12 @@ namespace config
     // ---- W5500 ----
     constexpr uint8_t CS_PIN = 16;
     constexpr uint8_t SCK = 18;
-    constexpr uint8_t MISO = 19;
-    constexpr uint8_t MOSI = 23;
+    constexpr uint8_t MISO = 23;
+    constexpr uint8_t MOSI = 19;
 
     // ---- Rotary Encoder ----
     constexpr uint8_t PIN_CLK = 32;
-    constexpr uint8_t PIN_DT = 35;     // GPIO35 input-only, TIDAK punya pull-ernal: pasang 10k ke 3V3
+    constexpr uint8_t PIN_DT = 35;     // GPIO35 input-only, TIDAK punya pullup-internal: pasang 10k ke 3V3
     constexpr uint8_t PIN_SW = 5;      // Rotary Encoder Button (OK)
     constexpr uint8_t PIN_BTN_PIN = 4; // Tombol fisik tunggal (BACK)
 
@@ -52,18 +52,18 @@ namespace config
     // ---- OTA -----
 
     // ---- Subscribe Topic MQTT Sanding Besar ----
-    const char *topicMasuk = "pabrik/veneer/jumlah";
-    const char *topicKeluar = "pabrik/veneer/jumlah2";
-    const char *topicRefresh = "pabrik/veneer/refresh";
-    const char *topicPerintah = "pabrik/veneer/perintah";
-    const char *topicAck = "pabrik/veneer/ack";
-    const char *topicMode = "pabrik/veneer/mode";
+    constexpr char *topicMasuk = "pabrik/veneer/jumlah";
+    constexpr char *topicKeluar = "pabrik/veneer/jumlah2";
+    constexpr char *topicRefresh = "pabrik/veneer/refresh";
+    constexpr char *topicPerintah = "pabrik/veneer/perintah";
+    constexpr char *topicAck = "pabrik/veneer/ack";
+    constexpr char *topicMode = "pabrik/veneer/mode";
 
     // ---- MQTT HMI ----
-    const char *topicHmiStatus = TOPIC_BASE "status";
-    const char *topicHmiIP = TOPIC_BASE "ip";
-    const char *topicHmiDiag = TOPIC_BASE "diag";
-    const char *topicHmiPerintah = TOPIC_BASE "perintah";
-    const char *topicHmiOta = TOPIC_BASE "ota";
-    const char *topicHmiAktif = TOPIC_BASE "aktif";
+    constexpr char *topicHmiStatus = TOPIC_BASE "status";
+    constexpr char *topicHmiIP = TOPIC_BASE "ip";
+    constexpr char *topicHmiDiag = TOPIC_BASE "diag";
+    constexpr char *topicHmiPerintah = TOPIC_BASE "perintah";
+    constexpr char *topicHmiOta = TOPIC_BASE "ota";
+    constexpr char *topicHmiAktif = TOPIC_BASE "aktif";
 }
