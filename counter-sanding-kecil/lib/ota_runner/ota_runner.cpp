@@ -28,6 +28,8 @@ const char *otaRunResultCode(OtaRunResult r)
         return "manifest_signature_invalid";
     case OtaRunResult::ManifestInvalid:
         return "manifest_invalid";
+    case OtaRunResult::UnexpectedBuild:
+        return "unexpected_build";
     case OtaRunResult::PolicyRejected:
         return "policy_rejected";
     case OtaRunResult::FlashBeginFailed:
@@ -42,6 +44,31 @@ const char *otaRunResultCode(OtaRunResult r)
         return "timed_out";
     }
     return "unknown";
+}
+
+OtaResult otaResultFor(OtaRunResult r)
+{
+    switch (r)
+    {
+    case OtaRunResult::Installed:
+    case OtaRunResult::DryRunOk:
+        return OtaResult::None;
+    case OtaRunResult::BadConfig:
+    case OtaRunResult::ManifestDownloadFailed:
+    case OtaRunResult::FirmwareDownloadFailed:
+    case OtaRunResult::TimedOut:
+        return OtaResult::DownloadFailed;
+    case OtaRunResult::ManifestSignatureInvalid:
+    case OtaRunResult::ManifestInvalid:
+    case OtaRunResult::UnexpectedBuild:
+    case OtaRunResult::PolicyRejected:
+    case OtaRunResult::FirmwareVerifyFailed:
+        return OtaResult::VerifyFailed;
+    case OtaRunResult::FlashBeginFailed:
+    case OtaRunResult::ActivateFailed:
+        return OtaResult::WriteFailed;
+    }
+    return OtaResult::DownloadFailed;
 }
 
 DownloadState OtaRunner::pump(FirmwareDownloader &d, uint32_t startMs, uint32_t timeoutMs,
@@ -131,6 +158,12 @@ OtaRunOutcome OtaRunner::run(const OtaRunConfig &cfg)
     }
     out.manifest = m;
     out.manifestValid = true;
+    if (cfg.expectedBuild != 0 && m.build != cfg.expectedBuild)
+    {
+        out.result = OtaRunResult::UnexpectedBuild;
+        out.detail = "build di manifest tidak sama dengan yang diminta";
+        return out;
+    }
     snprintf(line, sizeof(line), "OTA: manifest sah, versi %s, build %lu, %lu byte", m.version,
              static_cast<unsigned long>(m.build), static_cast<unsigned long>(m.size));
     say(line);

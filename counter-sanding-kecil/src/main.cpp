@@ -25,6 +25,8 @@
 #include "arduino_clock.h"
 #include "ota_runner.h"
 #include "ota_public_key.h"
+#include "line_router.h"
+#include "ota_command.h"
 
 using namespace config;
 
@@ -70,6 +72,14 @@ OtaStateMachine otaMachine(
     otaStore,
     OtaConfig{OTA_MAX_PENDING_BOOTS, OTA_MAX_REQUEST_ATTEMPTS, OTA_MAX_ROLLBACK_ATTEMPTS,
               OTA_HEALTH_DEADLINE_MS});
+
+BootAction aksiBootOta = BootAction::Normal; // hasil onBoot(), dibaca setup() dan networkTask
+bool otaMengawasi = false;                   // true: firmware baru berstatus Pending, menunggu terbukti sehat
+volatile uint32_t otaTargetDiminta = 0;      // diisi loop() dari perintah Serial, dilayani networkTask
+
+// Baris Serial ditawarkan dulu ke penangan OTA; yang bukan perintah OTA diteruskan ke konsol.
+LineRouter serialRouter([](char c)
+                        { serialConsole.feed(c); });
 
 // =====================================================
 // SAKLAR HITUNG
@@ -284,6 +294,157 @@ void sensorTask(void *parameter)
 }
 
 // =====================================================
+// OTA
+// Pemasangan sungguhan berjalan pada BOOT BERSIH: di setup(), sebelum task
+// dibuat, sehingga hanya satu thread yang memakai Ethernet. Permintaannya
+// datang dari perintah Serial "ota <build>" (SEMENTARA; kelak dari MQTT) dan
+// dilayani networkTask, pemilik tunggal otaMachine.
+// =====================================================
+OtaRunOutcome jalankanOtaRunner(bool dryRun, uint32_t buildDiminta)
+{
+  EthernetHttpTransport transport;
+  EspOtaFlash flash;
+  ArduinoClock jam;
+  OtaRunner runner(transport, flash, jam, [](const char *baris)
+                   { Serial.println(baris); });
+
+  const esp_partition_t *slotBerikut = esp_ota_get_next_update_partition(nullptr);
+
+  OtaRunConfig cfg;
+  cfg.host = OTA_HOST;
+  cfg.port = OTA_PORT;
+  cfg.manifestPath = OTA_MANIFEST_PATH;
+  cfg.firmwarePath = OTA_FIRMWARE_PATH;
+  cfg.publicKey = ota::SIGNING_PUBLIC_KEY;
+  cfg.dryRun = dryRun;
+  cfg.expectedBuild = buildDiminta;
+  cfg.profile = DeviceProfile{OTA_DEVICE_TYPE, OTA_BOARD, static_cast<uint32_t>(firmwareInfo.build()),
+                              slotBerikut != nullptr ? slotBerikut->size : 0};
+  cfg.overallTimeoutMs = OTA_OVERALL_TIMEOUT_MS;
+  return runner.run(cfg);
+}
+
+void cetakHasilOta(const OtaRunOutcome &hasil)
+{
+  Serial.print("OTA: hasil=");
+  Serial.print(otaRunResultCode(hasil.result));
+  Serial.print(" - ");
+  Serial.println(hasil.detail);
+}
+
+// Dipanggil dari setup() bila onBoot() menjawab RunOta.
+void prosesOtaBootBersih()
+{
+  Serial.println("OTA: boot bersih, memulai pemasangan.");
+  lcdView.showMessage("UPDATE FIRMWARE", "JANGAN DIMATIKAN");
+
+  OtaRunOutcome hasil;
+  if (netMonitor.isOnline())
+  {
+    hasil = jalankanOtaRunner(false, otaMachine.record().targetBuild);
+  }
+  else
+  {
+    hasil.result = OtaRunResult::ManifestDownloadFailed;
+    hasil.detail = "LAN belum online";
+  }
+  cetakHasilOta(hasil);
+
+  if (hasil.result == OtaRunResult::Installed)
+  {
+    otaMachine.otaInstalled(); // bila gagal menyimpan, onBoot() berikutnya memperbaikinya
+    Serial.println("OTA: terpasang. Memulai ulang ke firmware baru...");
+    delay(500);
+    ESP.restart();
+  }
+
+  otaMachine.otaFailed(otaResultFor(hasil.result));
+  Serial.println("OTA: gagal. Perangkat lanjut dengan firmware yang sekarang.");
+}
+
+#ifdef OTA_DRY_RUN_ON_BOOT
+// SEMENTARA: uji kering tanpa mengalihkan slot boot.
+void ujiKeringOta()
+{
+  if (!netMonitor.isOnline())
+  {
+    Serial.println("OTA DRY RUN dilewati: LAN belum online.");
+    return;
+  }
+  cetakHasilOta(jalankanOtaRunner(true, 0));
+}
+#endif
+
+// Penangan baris Serial: "ota <build>". Hanya mencatat permintaan; networkTask yang melayaninya.
+bool tanganiPerintahOta(const char *baris)
+{
+  uint32_t target = 0;
+  switch (OtaCommand::parse(baris, target))
+  {
+  case OtaCommandResult::NotOta:
+    return false;
+  case OtaCommandResult::BadArgument:
+    Serial.println("Pemakaian: ota <nomor build>, contoh: ota 2");
+    return true;
+  case OtaCommandResult::Ok:
+    otaTargetDiminta = target;
+    return true;
+  }
+  return false;
+}
+
+// networkTask: melayani permintaan "ota <build>".
+void prosesPermintaanOta()
+{
+  const uint32_t target = otaTargetDiminta;
+  if (target == 0)
+    return;
+  otaTargetDiminta = 0;
+
+  if (!otaMachine.requestUpdate(target, static_cast<uint32_t>(firmwareInfo.build())))
+  {
+    Serial.print("OTA: permintaan ditolak, state=");
+    Serial.println(otaStateCode(otaMachine.state()));
+    return;
+  }
+  Serial.print("OTA: update ke build ");
+  Serial.print(target);
+  Serial.println(" diminta. Memulai ulang ke boot bersih...");
+  vTaskDelay(pdMS_TO_TICKS(300));
+  ESP.restart();
+}
+
+// networkTask: firmware baru (Pending) harus membuktikan diri sehat.
+// SEMENTARA di Langkah 20a: pemeriksaan server belum ada, dianggap sehat (diisi di 20b);
+// rollback belum dijalankan (diisi di 20c).
+void awasiKesehatanOta(unsigned long now)
+{
+  constexpr unsigned long INTERVAL_MS = 1000;
+  static unsigned long terakhir = 0;
+  if (!otaMengawasi || now - terakhir < INTERVAL_MS)
+    return;
+  terakhir = now;
+
+  const HealthReport laporan{netMonitor.isOnline(), mqtt.isConnected(), true};
+  switch (otaMachine.tick(now, laporan))
+  {
+  case HealthAction::Confirmed:
+    Serial.println("OTA: firmware baru terkonfirmasi sehat.");
+    otaMengawasi = false;
+    break;
+  case HealthAction::Rollback:
+    Serial.println("OTA: batas waktu habis, rollback DIPERLUKAN (belum didukung di Langkah 20a).");
+    otaMengawasi = false;
+    break;
+  case HealthAction::NotNeeded:
+    otaMengawasi = false;
+    break;
+  case HealthAction::Waiting:
+    break;
+  }
+}
+
+// =====================================================
 // TASK NETWORK (CORE 1)
 // Satu-satunya pemilik MQTT dan LCD.
 // =====================================================
@@ -342,6 +503,12 @@ void networkTask(void *parameter)
     }
 
     // -------------------------------------------------
+    // OTA: permintaan dari Serial dan pembuktian sehat firmware baru
+    // -------------------------------------------------
+    prosesPermintaanOta();
+    awasiKesehatanOta(now);
+
+    // -------------------------------------------------
     // Ganti halaman LCD
     // -------------------------------------------------
     handleLCD();
@@ -351,47 +518,13 @@ void networkTask(void *parameter)
 }
 
 // =====================================================
-// UJI KERING OTA (SEMENTARA, hanya bila -DOTA_DRY_RUN_ON_BOOT)
-// Dijalankan di setup() SEBELUM task dibuat, jadi hanya satu thread yang
-// memakai Ethernet. Mengunduh manifest + firmware ke slot cadangan dan
-// memverifikasinya, TANPA mengalihkan slot boot.
-// =====================================================
-#ifdef OTA_DRY_RUN_ON_BOOT
-void jalankanOtaDryRun()
-{
-  EthernetHttpTransport transport;
-  EspOtaFlash flash;
-  ArduinoClock jam;
-  OtaRunner runner(transport, flash, jam, [](const char *baris)
-                   { Serial.println(baris); });
-
-  const esp_partition_t *slotBerikut = esp_ota_get_next_update_partition(nullptr);
-
-  OtaRunConfig cfg;
-  cfg.host = OTA_HOST;
-  cfg.port = OTA_PORT;
-  cfg.manifestPath = OTA_MANIFEST_PATH;
-  cfg.firmwarePath = OTA_FIRMWARE_PATH;
-  cfg.publicKey = ota::SIGNING_PUBLIC_KEY;
-  cfg.dryRun = true;
-  cfg.profile = DeviceProfile{OTA_DEVICE_TYPE, OTA_BOARD, static_cast<uint32_t>(firmwareInfo.build()),
-                              slotBerikut != nullptr ? slotBerikut->size : 0};
-  cfg.overallTimeoutMs = OTA_OVERALL_TIMEOUT_MS;
-
-  const OtaRunOutcome hasil = runner.run(cfg);
-  Serial.print("OTA DRY RUN: ");
-  Serial.print(otaRunResultCode(hasil.result));
-  Serial.print(" - ");
-  Serial.println(hasil.detail);
-}
-#endif
-
-// =====================================================
 // SETUP
 // =====================================================
 void setup()
 {
   Serial.begin(115200);
+
+  serialRouter.addHandler(tanganiPerintahOta);
 
   configStore.begin();
   const int tidakValid = configManager.load(deviceConfig);
@@ -436,13 +569,15 @@ void setup()
                                            : "OTA: catatan belum ada atau rusak, dibuat baru");
 
   const BootAction aksiBoot = otaMachine.onBoot(firmwareInfo.build(), millis());
+  aksiBootOta = aksiBoot;
+  otaMengawasi = (aksiBoot == BootAction::WatchHealth);
   Serial.print("OTA: state=");
   Serial.print(otaStateCode(otaMachine.state()));
   Serial.print(", aksi boot=");
   Serial.println(bootActionCode(aksiBoot));
-  if (aksiBoot != BootAction::Normal)
+  if (aksiBoot == BootAction::Rollback)
   {
-    Serial.println("PERINGATAN: aksi OTA ini belum didukung firmware ini.");
+    Serial.println("PERINGATAN: rollback belum didukung firmware ini (Langkah 20c).");
   }
   Serial.print(firmwareInfo.version());
   Serial.print(" (build ");
@@ -480,14 +615,14 @@ void setup()
     Serial.println("DHCP gagal, akan dicoba lagi otomatis.");
   }
 
-#ifdef OTA_DRY_RUN_ON_BOOT
-  if (netMonitor.isOnline())
+  if (aksiBootOta == BootAction::RunOta)
   {
-    jalankanOtaDryRun();
+    prosesOtaBootBersih(); // bila berhasil, perangkat restart dan tidak kembali ke sini
   }
+#ifdef OTA_DRY_RUN_ON_BOOT
   else
   {
-    Serial.println("OTA DRY RUN dilewati: LAN belum online.");
+    ujiKeringOta();
   }
 #endif
 
@@ -543,7 +678,7 @@ void loop()
 {
   while (Serial.available() > 0)
   {
-    serialConsole.feed((char)Serial.read());
+    serialRouter.feed((char)Serial.read());
   }
   vTaskDelay(pdMS_TO_TICKS(20));
 }

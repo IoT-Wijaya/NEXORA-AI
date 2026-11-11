@@ -452,6 +452,45 @@ void test_kunci_publik_nol_menolak_semuanya()
     TEST_ASSERT_EQUAL(0, r.flash.begins);
 }
 
+void test_build_di_manifest_beda_dari_yang_diminta_ditolak()
+{
+    Rig r;
+    r.goodServer(); // manifest berisi build 12
+    OtaRunConfig c = config(false);
+    c.expectedBuild = 13;
+    const OtaRunOutcome o = r.runner.run(c);
+    TEST_ASSERT_EQUAL(OtaRunResult::UnexpectedBuild, o.result);
+    TEST_ASSERT_TRUE(o.manifestValid);
+    TEST_ASSERT_EQUAL(0, r.flash.begins);
+    TEST_ASSERT_EQUAL(0, r.server.count(FPATH));
+}
+
+void test_build_yang_diminta_sama_dengan_manifest_diterima()
+{
+    Rig r;
+    r.goodServer();
+    OtaRunConfig c = config(true);
+    c.expectedBuild = 12;
+    TEST_ASSERT_EQUAL(OtaRunResult::DryRunOk, r.runner.run(c).result);
+}
+
+void test_pemetaan_hasil_runner_ke_catatan_ota()
+{
+    TEST_ASSERT_EQUAL(OtaResult::None, otaResultFor(OtaRunResult::Installed));
+    TEST_ASSERT_EQUAL(OtaResult::None, otaResultFor(OtaRunResult::DryRunOk));
+    TEST_ASSERT_EQUAL(OtaResult::DownloadFailed, otaResultFor(OtaRunResult::ManifestDownloadFailed));
+    TEST_ASSERT_EQUAL(OtaResult::DownloadFailed, otaResultFor(OtaRunResult::FirmwareDownloadFailed));
+    TEST_ASSERT_EQUAL(OtaResult::DownloadFailed, otaResultFor(OtaRunResult::TimedOut));
+    TEST_ASSERT_EQUAL(OtaResult::DownloadFailed, otaResultFor(OtaRunResult::BadConfig));
+    TEST_ASSERT_EQUAL(OtaResult::VerifyFailed, otaResultFor(OtaRunResult::ManifestSignatureInvalid));
+    TEST_ASSERT_EQUAL(OtaResult::VerifyFailed, otaResultFor(OtaRunResult::ManifestInvalid));
+    TEST_ASSERT_EQUAL(OtaResult::VerifyFailed, otaResultFor(OtaRunResult::UnexpectedBuild));
+    TEST_ASSERT_EQUAL(OtaResult::VerifyFailed, otaResultFor(OtaRunResult::PolicyRejected));
+    TEST_ASSERT_EQUAL(OtaResult::VerifyFailed, otaResultFor(OtaRunResult::FirmwareVerifyFailed));
+    TEST_ASSERT_EQUAL(OtaResult::WriteFailed, otaResultFor(OtaRunResult::FlashBeginFailed));
+    TEST_ASSERT_EQUAL(OtaResult::WriteFailed, otaResultFor(OtaRunResult::ActivateFailed));
+}
+
 void test_runner_bisa_dipakai_ulang()
 {
     Rig r;
@@ -484,6 +523,9 @@ int main()
     RUN_TEST(test_server_macet_selamanya_berhenti_di_batas_waktu_keseluruhan);
     RUN_TEST(test_konfigurasi_kosong);
     RUN_TEST(test_kunci_publik_nol_menolak_semuanya);
+    RUN_TEST(test_build_di_manifest_beda_dari_yang_diminta_ditolak);
+    RUN_TEST(test_build_yang_diminta_sama_dengan_manifest_diterima);
+    RUN_TEST(test_pemetaan_hasil_runner_ke_catatan_ota);
     RUN_TEST(test_runner_bisa_dipakai_ulang);
     return UNITY_END();
 }

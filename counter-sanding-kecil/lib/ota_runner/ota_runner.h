@@ -8,6 +8,7 @@
 #include "iclock.h"
 #include "iota_flash.h"
 #include "manifest.h"
+#include "ota_record.h"
 #include "signed_manifest.h"
 #include "update_policy.h"
 
@@ -20,6 +21,7 @@ struct OtaRunConfig
     const uint8_t *publicKey = nullptr; // 32 byte, kunci publik penanda tangan rilis
     DeviceProfile profile{};            // identitas dan keadaan perangkat ini
     bool dryRun = false;                // true: berhenti sebelum slot boot dialihkan
+    uint32_t expectedBuild = 0;         // build yang DIMINTA; 0 = terima build apa pun yang lolos kebijakan
     uint32_t overallTimeoutMs = 600000; // batas seluruh proses (manifest + firmware)
     uint8_t maxFailuresWithoutProgress = 5;
     uint32_t retryDelayMs = 2000;
@@ -34,6 +36,7 @@ enum class OtaRunResult
     ManifestDownloadFailed,
     ManifestSignatureInvalid,
     ManifestInvalid,
+    UnexpectedBuild, // manifest sah, tetapi buildnya bukan yang diminta
     PolicyRejected,
     FlashBeginFailed,
     FirmwareDownloadFailed,
@@ -43,6 +46,10 @@ enum class OtaRunResult
 };
 
 const char *otaRunResultCode(OtaRunResult result);
+
+// Hasil runner yang gagal -> alasan yang dicatat mesin status OTA. Installed dan
+// DryRunOk tidak punya padanan (None): keduanya bukan kegagalan.
+OtaResult otaResultFor(OtaRunResult result);
 
 struct OtaRunOutcome
 {
