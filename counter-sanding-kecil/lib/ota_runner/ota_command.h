@@ -1,4 +1,5 @@
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 enum class OtaCommandResult
@@ -16,5 +17,10 @@ namespace OtaCommand
     // Nomor build harus 1 sampai 4294967295, hanya angka, tanpa tambahan apa pun.
     // `build` hanya diisi bila hasilnya Ok.
     OtaCommandResult parse(const char *line, uint32_t &build);
+
+    // Sama seperti parse(), untuk muatan pesan MQTT: panjangnya diberi, tidak perlu diakhiri
+    // NUL. CR/LF di ujung diabaikan. Muatan lebih dari 32 byte atau berisi NUL di tengah
+    // dianggap BadArgument (bukan perintah yang sah).
+    OtaCommandResult parseBytes(const uint8_t *data, size_t length, uint32_t &build);
 
 } // namespace OtaCommand

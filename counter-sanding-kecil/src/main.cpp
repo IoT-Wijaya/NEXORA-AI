@@ -27,6 +27,11 @@
 #include "ota_public_key.h"
 #include "line_router.h"
 #include "ota_command.h"
+#include "server_proof.h"
+#include "rollback.h"
+#include "esp_boot_slots.h"
+#include "esp_task_watchdog.h"
+#include "ota_reporter.h"
 
 using namespace config;
 
@@ -73,9 +78,20 @@ OtaStateMachine otaMachine(
     OtaConfig{OTA_MAX_PENDING_BOOTS, OTA_MAX_REQUEST_ATTEMPTS, OTA_MAX_ROLLBACK_ATTEMPTS,
               OTA_HEALTH_DEADLINE_MS});
 
+// Mengirim hasil OTA yang belum dilaporkan; dipakai HANYA oleh networkTask.
+OtaReporter otaReporter(
+    otaMachine,
+    [](const char *json)
+    { return mqtt.publishOtaReport(json); },
+    OTA_REPORT_RETRY_MS);
+
 BootAction aksiBootOta = BootAction::Normal; // hasil onBoot(), dibaca setup() dan networkTask
 bool otaMengawasi = false;                   // true: firmware baru berstatus Pending, menunggu terbukti sehat
 volatile uint32_t otaTargetDiminta = 0;      // diisi loop() dari perintah Serial, dilayani networkTask
+
+// Bukti bahwa broker menerima keadaan awal boot ini. Ditulis dan dibaca HANYA oleh networkTask
+// (publishKeadaanAwal dan awasiKesehatanOta), jadi tidak perlu mutex.
+ServerProof serverProof;
 
 // Baris Serial ditawarkan dulu ke penangan OTA; yang bukan perintah OTA diteruskan ke konsol.
 LineRouter serialRouter([](char c)
@@ -193,13 +209,19 @@ void publishKeadaanAwal()
   char ip[20];
   formatIp(netMonitor.localIp(), ip, sizeof(ip));
 
+  // Setiap MQTT tersambung dimulai putaran bukti baru: server dianggap sehat bila
+  // SEMUA publish keadaan awal diterima (dipakai pengawas kesehatan OTA).
+  serverProof.begin();
+
   // Setelah restart, mode "OFF" -> HMI tahu sensor perlu START ulang.
-  mqtt.publishOnConnect(c.hasil, c.modal, hitungAktif, ip);
+  serverProof.record(mqtt.publishOnConnect(c.hasil, c.modal, hitungAktif, ip));
 
   // Versi firmware sebagai JSON, retained. Dipanggil sekali setiap MQTT tersambung.
   char versi[FirmwareInfo::JSON_SIZE];
   firmwareInfo.toJson(versi, sizeof(versi));
-  mqtt.publishVersion(versi);
+  serverProof.record(mqtt.publishVersion(versi));
+
+  serverProof.finish();
 }
 
 // =====================================================
@@ -262,6 +284,10 @@ void prosesTombolReset()
 void sensorTask(void *parameter)
 {
   Serial.println("Sensor Task START");
+
+  // Task ini harus terpasang ke watchdog agar perangkat reset bila macet.
+  if (!EspTaskWatchdog::subscribeCurrentTask())
+    Serial.println("PERINGATAN: task tidak terpasang ke watchdog.");
 
   for (;;)
   {
@@ -362,6 +388,25 @@ void prosesOtaBootBersih()
   Serial.println("OTA: gagal. Perangkat lanjut dengan firmware yang sekarang.");
 }
 
+// Dipanggil dari setup() bila onBoot() menjawab Rollback. Tidak kembali: perangkat restart.
+// Bila gagal, restart tetap dilakukan; state machine membatasi percobaan (OTA_MAX_ROLLBACK_ATTEMPTS).
+void prosesRollbackBoot()
+{
+  Serial.println("OTA: ROLLBACK ke firmware lama.");
+  lcdView.showMessage("ROLLBACK", "JANGAN DIMATIKAN");
+
+  EspBootSlots slots;
+  const RollbackResult hasil = rollbackToPrevious(slots);
+  Serial.print("OTA: rollback=");
+  Serial.println(rollbackResultCode(hasil));
+  if (hasil != RollbackResult::Switched)
+  {
+    Serial.println(slots.lastError());
+  }
+  delay(500);
+  ESP.restart();
+}
+
 #ifdef OTA_DRY_RUN_ON_BOOT
 // SEMENTARA: uji kering tanpa mengalihkan slot boot.
 void ujiKeringOta()
@@ -393,6 +438,26 @@ bool tanganiPerintahOta(const char *baris)
   return false;
 }
 
+// Perintah OTA dari MQTT. Berjalan di networkTask; hanya mencatat permintaan,
+// pelaksanaannya oleh prosesPermintaanOta() seperti pada perintah Serial.
+void handleOtaMqtt(OtaMessage pesan, uint32_t build)
+{
+  switch (pesan)
+  {
+  case OtaMessage::Valid:
+    Serial.print("MQTT: perintah OTA diterima, build ");
+    Serial.println(build);
+    otaTargetDiminta = build;
+    break;
+  case OtaMessage::TooEarly:
+    Serial.println("MQTT: perintah OTA diabaikan (tiba tepat setelah tersambung, mungkin retained).");
+    break;
+  case OtaMessage::Malformed:
+    Serial.println("MQTT: perintah OTA diabaikan (format salah, harus 'ota <build>').");
+    break;
+  }
+}
+
 // networkTask: melayani permintaan "ota <build>".
 void prosesPermintaanOta()
 {
@@ -400,6 +465,15 @@ void prosesPermintaanOta()
   if (target == 0)
     return;
   otaTargetDiminta = 0;
+
+  // Permintaan OTA hanya diterima bila firmware baru lebih baru dari yang sekarang.
+  if (target <= static_cast<uint32_t>(firmwareInfo.build()))
+  {
+    Serial.print("OTA: permintaan diabaikan, build target ");
+    Serial.print(target);
+    Serial.println(" tidak lebih baru dari build sekarang.");
+    return;
+  }
 
   if (!otaMachine.requestUpdate(target, static_cast<uint32_t>(firmwareInfo.build())))
   {
@@ -415,8 +489,8 @@ void prosesPermintaanOta()
 }
 
 // networkTask: firmware baru (Pending) harus membuktikan diri sehat.
-// SEMENTARA di Langkah 20a: pemeriksaan server belum ada, dianggap sehat (diisi di 20b);
-// rollback belum dijalankan (diisi di 20c).
+// Sehat = LAN online, MQTT tersambung, DAN broker menerima semua publish keadaan awal
+// boot ini (serverProof). Rollback belum dijalankan (diisi di 20c).
 void awasiKesehatanOta(unsigned long now)
 {
   constexpr unsigned long INTERVAL_MS = 1000;
@@ -425,7 +499,7 @@ void awasiKesehatanOta(unsigned long now)
     return;
   terakhir = now;
 
-  const HealthReport laporan{netMonitor.isOnline(), mqtt.isConnected(), true};
+  const HealthReport laporan{netMonitor.isOnline(), mqtt.isConnected(), serverProof.ok()};
   switch (otaMachine.tick(now, laporan))
   {
   case HealthAction::Confirmed:
@@ -433,13 +507,34 @@ void awasiKesehatanOta(unsigned long now)
     otaMengawasi = false;
     break;
   case HealthAction::Rollback:
-    Serial.println("OTA: batas waktu habis, rollback DIPERLUKAN (belum didukung di Langkah 20a).");
+    Serial.println("OTA: batas waktu habis, rollback. Memulai ulang...");
     otaMengawasi = false;
+    vTaskDelay(pdMS_TO_TICKS(300));
+    ESP.restart();
     break;
   case HealthAction::NotNeeded:
     otaMengawasi = false;
     break;
   case HealthAction::Waiting:
+    break;
+  }
+}
+
+// networkTask: melaporkan hasil OTA terakhir ke website sampai berhasil.
+void laporkanHasilOta(unsigned long now)
+{
+  switch (otaReporter.service(now, mqtt.isConnected(), static_cast<uint32_t>(firmwareInfo.build())))
+  {
+  case OtaReportEvent::Sent:
+    Serial.println("OTA: hasil dilaporkan ke server.");
+    break;
+  case OtaReportEvent::SendFailed:
+    Serial.println("OTA: gagal mengirim laporan, dicoba lagi.");
+    break;
+  case OtaReportEvent::NotMarked:
+    Serial.println("OTA: laporan terkirim tetapi gagal ditandai, akan dikirim ulang.");
+    break;
+  case OtaReportEvent::Nothing:
     break;
   }
 }
@@ -451,6 +546,10 @@ void awasiKesehatanOta(unsigned long now)
 void networkTask(void *parameter)
 {
   Serial.println("Network Task START");
+
+  // Task ini harus terpasang ke watchdog agar perangkat reset bila macet.
+  if (!EspTaskWatchdog::subscribeCurrentTask())
+    Serial.println("PERINGATAN: task tidak terpasang ke watchdog.");
 
   for (;;)
   {
@@ -507,6 +606,7 @@ void networkTask(void *parameter)
     // -------------------------------------------------
     prosesPermintaanOta();
     awasiKesehatanOta(now);
+    laporkanHasilOta(now);
 
     // -------------------------------------------------
     // Ganti halaman LCD
@@ -575,10 +675,6 @@ void setup()
   Serial.print(otaStateCode(otaMachine.state()));
   Serial.print(", aksi boot=");
   Serial.println(bootActionCode(aksiBoot));
-  if (aksiBoot == BootAction::Rollback)
-  {
-    Serial.println("PERINGATAN: rollback belum didukung firmware ini (Langkah 20c).");
-  }
   Serial.print(firmwareInfo.version());
   Serial.print(" (build ");
   Serial.print(firmwareInfo.build());
@@ -597,6 +693,12 @@ void setup()
   lcdView.begin();
   lcdView.showMessage("SANDING KECIL", "STARTING...");
   delay(1500);
+
+  // Rollback: pindahkan slot boot ke firmware lama, lalu restart. Tidak kembali ke setup().
+  if (aksiBootOta == BootAction::Rollback)
+  {
+    prosesRollbackBoot();
+  }
 
   // SPI + ENC28J60
   SPI.begin(ENC_SCK, ENC_MISO, ENC_MOSI, ENC_CS_PIN);
@@ -637,6 +739,8 @@ void setup()
   mqttSettings.enabled = ConfigManager::isComplete(deviceConfig);
   mqtt.begin(mqttSettings);
   mqtt.onCommand(handleCommand);
+  // MQTT handling topic for OTA command
+  mqtt.onOtaCommand(handleOtaMqtt);
 
   if (!mqttSettings.enabled)
   {
@@ -646,6 +750,12 @@ void setup()
   // LCD awal
   lcdView.restartPageTimer(millis());
   updateLCD();
+
+  // Watchdog task: reset bila networkTask tidak melapor dalam batas waktu.
+  if (!EspTaskWatchdog::begin(TASK_WDT_TIMEOUT_S))
+  {
+    Serial.println("PERINGATAN: watchdog tugas gagal diatur.");
+  }
 
   // Task sensor di core 0
   xTaskCreatePinnedToCore(

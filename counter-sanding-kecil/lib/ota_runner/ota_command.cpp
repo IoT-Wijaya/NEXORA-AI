@@ -57,4 +57,27 @@ namespace OtaCommand
         return OtaCommandResult::Ok;
     }
 
+    OtaCommandResult parseBytes(const uint8_t *data, size_t length, uint32_t &build)
+    {
+        constexpr size_t MAX_LENGTH = 32;
+        if (data == nullptr || length == 0)
+            return OtaCommandResult::NotOta;
+        while (length > 0 && (data[length - 1] == '\r' || data[length - 1] == '\n'))
+            --length;
+        if (length == 0)
+            return OtaCommandResult::NotOta;
+        if (length > MAX_LENGTH)
+            return OtaCommandResult::BadArgument;
+
+        char line[MAX_LENGTH + 1];
+        for (size_t i = 0; i < length; ++i)
+        {
+            if (data[i] == '\0')
+                return OtaCommandResult::BadArgument;
+            line[i] = static_cast<char>(data[i]);
+        }
+        line[length] = '\0';
+        return parse(line, build);
+    }
+
 } // namespace OtaCommand

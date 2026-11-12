@@ -45,7 +45,9 @@ public:
     bool publish(const char *t, const char *p, bool r) override
     {
         terbit.push_back({t, p, r});
-        return true;
+        if (!tolakTopic.empty() && tolakTopic == t)
+            return false;
+        return !tolakSemua;
     }
     bool loop() override
     {
@@ -67,6 +69,8 @@ public:
 
     bool tersambung = false;
     bool terima = true;
+    bool tolakSemua = false;
+    std::string tolakTopic; // publish ke topic ini ditolak
     int kodeState = 5;
     int connectCalls = 0, loopCalls = 0, disconnectCalls = 0;
     std::string clientId, user, willTopic, willMessage;
@@ -110,8 +114,9 @@ void test_online_langsung_mencoba_sambung_dan_subscribe_dan_kirim_status()
     m.begin(buatSettings());
     TEST_ASSERT_EQUAL(ev(MqttEvent::Connected), ev(m.update(true, 0)));
     TEST_ASSERT_EQUAL(1, f.connectCalls);
-    TEST_ASSERT_EQUAL(1, (int)f.langganan.size());
+    TEST_ASSERT_EQUAL(2, (int)f.langganan.size());
     TEST_ASSERT_EQUAL_STRING(config::topicPerintah, f.langganan[0].c_str());
+    TEST_ASSERT_EQUAL_STRING(config::topicOta, f.langganan[1].c_str());
     TEST_ASSERT_EQUAL(1, (int)f.terbit.size());
     TEST_ASSERT_EQUAL_STRING(config::topicStatus, f.terbit[0].topic.c_str());
     TEST_ASSERT_EQUAL_STRING("ONLINE", f.terbit[0].payload.c_str());
@@ -310,6 +315,183 @@ void test_publishVersion_retained_ke_topic_versi()
     TEST_ASSERT_TRUE(f.terbit[0].retain);
 }
 
+void test_publishOnConnect_true_bila_semua_publish_diterima()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    TEST_ASSERT_TRUE(m.publishOnConnect(7, 9, false, "192.168.1.5"));
+    TEST_ASSERT_TRUE(m.publishOnConnect(7, 9, false, nullptr));
+}
+
+void test_publishOnConnect_false_bila_salah_satu_publish_ditolak_dan_sisanya_tetap_dikirim()
+{
+    const char *target[] = {config::topicJumlah, config::topicJumlah2, config::topicMode, config::topicIP};
+    for (const char *topik : target)
+    {
+        FakeMqtt f;
+        f.tolakTopic = topik;
+        MqttService m(f);
+        m.begin(buatSettings());
+        TEST_ASSERT_FALSE_MESSAGE(m.publishOnConnect(7, 9, false, "192.168.1.5"), topik);
+        TEST_ASSERT_EQUAL_MESSAGE(4, (int)f.terbit.size(), topik);
+    }
+}
+
+void test_publishOnConnect_false_bila_semua_ditolak()
+{
+    FakeMqtt f;
+    f.tolakSemua = true;
+    MqttService m(f);
+    m.begin(buatSettings());
+    TEST_ASSERT_FALSE(m.publishOnConnect(1, 2, true, "1.2.3.4"));
+}
+
+void test_publishVersion_mengembalikan_hasil_publish()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    TEST_ASSERT_TRUE(m.publishVersion("{}"));
+    f.tolakSemua = true;
+    TEST_ASSERT_FALSE(m.publishVersion("{}"));
+}
+
+struct CatatanOta
+{
+    int panggilan = 0;
+    OtaMessage terakhir = OtaMessage::Malformed;
+    uint32_t build = 0;
+};
+
+static void pasangOta(MqttService &m, CatatanOta &c)
+{
+    m.onOtaCommand([&c](OtaMessage pesan, uint32_t build)
+                   { c.panggilan++; c.terakhir = pesan; c.build = build; });
+}
+
+static const uint32_t HOLDOFF = config::MQTT_OTA_HOLDOFF_MS;
+
+void test_ota_sah_setelah_holdoff_diteruskan_dengan_build()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    CatatanOta c;
+    pasangOta(m, c);
+    m.update(true, 1000);           // tersambung
+    m.update(true, 1000 + HOLDOFF); // waktu berjalan
+    f.kirim(config::topicOta, "ota 7");
+    TEST_ASSERT_EQUAL(1, c.panggilan);
+    TEST_ASSERT_EQUAL((int)OtaMessage::Valid, (int)c.terakhir);
+    TEST_ASSERT_EQUAL_UINT32(7, c.build);
+}
+
+void test_ota_terlalu_dekat_dengan_sambung_dilaporkan_tooearly()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    CatatanOta c;
+    pasangOta(m, c);
+    m.update(true, 1000);
+    m.update(true, 1000 + HOLDOFF - 1);
+    f.kirim(config::topicOta, "ota 7"); // mis. pesan retained yang dikirim broker
+    TEST_ASSERT_EQUAL(1, c.panggilan);
+    TEST_ASSERT_EQUAL((int)OtaMessage::TooEarly, (int)c.terakhir);
+    TEST_ASSERT_EQUAL_UINT32(0, c.build);
+}
+
+void test_ota_holdoff_dihitung_ulang_pada_setiap_sambung()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    CatatanOta c;
+    pasangOta(m, c);
+    m.update(true, 1000);
+    m.update(true, 1000 + HOLDOFF + 500);
+    f.tersambung = false; // broker putus
+    const uint32_t ulang = 1000 + HOLDOFF + 500 + ULANG;
+    m.update(true, ulang); // sambung ulang
+    f.kirim(config::topicOta, "ota 7");
+    TEST_ASSERT_EQUAL((int)OtaMessage::TooEarly, (int)c.terakhir);
+}
+
+void test_ota_muatan_salah_dilaporkan_malformed_dan_tidak_membawa_build()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    CatatanOta c;
+    pasangOta(m, c);
+    m.update(true, 1000);
+    m.update(true, 1000 + HOLDOFF);
+    const char *buruk[] = {"ota", "ota 0", "ota abc", "START", "", "ota 5 6"};
+    for (const char *s : buruk)
+    {
+        c.panggilan = 0;
+        f.kirim(config::topicOta, s);
+        TEST_ASSERT_EQUAL_MESSAGE(1, c.panggilan, s);
+        TEST_ASSERT_EQUAL_MESSAGE((int)OtaMessage::Malformed, (int)c.terakhir, s);
+        TEST_ASSERT_EQUAL_UINT32(0, c.build);
+    }
+}
+
+void test_ota_tanpa_penangan_tidak_crash()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    m.update(true, 1000);
+    f.kirim(config::topicOta, "ota 7");
+    TEST_ASSERT_TRUE(true);
+}
+
+void test_pesan_ota_tidak_pernah_menjadi_perintah_biasa()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    int perintah = 0;
+    m.onCommand([&](Command)
+                { perintah++; });
+    CatatanOta c;
+    pasangOta(m, c);
+    m.update(true, 1000);
+    m.update(true, 1000 + HOLDOFF);
+    f.kirim(config::topicOta, "ota 7");
+    TEST_ASSERT_EQUAL(0, perintah);
+}
+
+void test_perintah_biasa_tidak_sampai_ke_penangan_ota()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    m.onCommand([](Command) {});
+    CatatanOta c;
+    pasangOta(m, c);
+    m.update(true, 1000);
+    m.update(true, 1000 + HOLDOFF);
+    f.kirim(config::topicPerintah, "ota 7");
+    TEST_ASSERT_EQUAL(0, c.panggilan);
+}
+
+void test_publishOtaReport_retained_ke_topic_status_ota_dan_mengembalikan_hasil()
+{
+    FakeMqtt f;
+    MqttService m(f);
+    m.begin(buatSettings());
+    TEST_ASSERT_TRUE(m.publishOtaReport("{\"result\":\"confirmed\"}"));
+    TEST_ASSERT_EQUAL(1, (int)f.terbit.size());
+    TEST_ASSERT_EQUAL_STRING(config::topicOtaStatus, f.terbit[0].topic.c_str());
+    TEST_ASSERT_EQUAL_STRING("{\"result\":\"confirmed\"}", f.terbit[0].payload.c_str());
+    TEST_ASSERT_TRUE(f.terbit[0].retain);
+    f.tolakSemua = true;
+    TEST_ASSERT_FALSE(m.publishOtaReport("{}"));
+}
+
 int main()
 {
     UNITY_BEGIN();
@@ -328,5 +510,17 @@ int main()
     RUN_TEST(test_perintah_masuk_tanpa_handler_tidak_crash);
     RUN_TEST(test_tidak_aktif_tidak_pernah_menyambung);
     RUN_TEST(test_publishVersion_retained_ke_topic_versi);
+    RUN_TEST(test_publishOnConnect_true_bila_semua_publish_diterima);
+    RUN_TEST(test_publishOnConnect_false_bila_salah_satu_publish_ditolak_dan_sisanya_tetap_dikirim);
+    RUN_TEST(test_publishOnConnect_false_bila_semua_ditolak);
+    RUN_TEST(test_publishVersion_mengembalikan_hasil_publish);
+    RUN_TEST(test_ota_sah_setelah_holdoff_diteruskan_dengan_build);
+    RUN_TEST(test_ota_terlalu_dekat_dengan_sambung_dilaporkan_tooearly);
+    RUN_TEST(test_ota_holdoff_dihitung_ulang_pada_setiap_sambung);
+    RUN_TEST(test_ota_muatan_salah_dilaporkan_malformed_dan_tidak_membawa_build);
+    RUN_TEST(test_ota_tanpa_penangan_tidak_crash);
+    RUN_TEST(test_pesan_ota_tidak_pernah_menjadi_perintah_biasa);
+    RUN_TEST(test_perintah_biasa_tidak_sampai_ke_penangan_ota);
+    RUN_TEST(test_publishOtaReport_retained_ke_topic_status_ota_dan_mengembalikan_hasil);
     return UNITY_END();
 }

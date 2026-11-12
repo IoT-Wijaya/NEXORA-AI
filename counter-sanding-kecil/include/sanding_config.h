@@ -63,6 +63,11 @@ namespace config
     constexpr uint32_t OTA_OVERALL_TIMEOUT_MS = 600000UL;
     static_assert(OTA_HEALTH_DEADLINE_MS >= 60000UL && OTA_HEALTH_DEADLINE_MS <= 600000UL,
                   "batas waktu pembuktian sehat harus antara 1 dan 10 menit");
+    // Task yang tidak melapor dalam batas ini membuat perangkat reset. Harus lebih lama dari
+    // pemblokiran terpanjang networkTask (DHCP 8 dtk, sambung MQTT sampai ±20 dtk).
+    constexpr uint32_t TASK_WDT_TIMEOUT_S = 30;
+    static_assert(TASK_WDT_TIMEOUT_S * 1000UL * 2 <= OTA_HEALTH_DEADLINE_MS,
+                  "watchdog harus jauh lebih pendek dari tenggat kesehatan OTA");
 
     // ---- Topic MQTT ----
     constexpr const char *topicStatus = TOPIC_BASE "status";
@@ -74,7 +79,13 @@ namespace config
     constexpr const char *topicVersi = TOPIC_BASE "versi";
     constexpr const char *topicMode = TOPIC_BASE "mode";
 
+    // OTA MQTT TOPIC
+    constexpr const char *topicOta = TOPIC_BASE "ota_perintah";
+    constexpr const char *topicOtaStatus = TOPIC_BASE "ota_status";
+
     constexpr unsigned long DHCP_TIMEOUT_MS = 8000;
     constexpr unsigned long DHCP_RESPONSE_TIMEOUT_MS = 2000;
+    constexpr unsigned long MQTT_OTA_HOLDOFF_MS = 3000;
+    constexpr uint32_t OTA_REPORT_RETRY_MS = 5000;
 
 } // namespace config
