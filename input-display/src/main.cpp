@@ -5,7 +5,7 @@
 #include <EthernetUdp.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
-#include "display_config.h"
+#include "config.h"
 #include <Preferences.h>
 #include <Update.h>
 #include "mbedtls/sha256.h"
@@ -15,6 +15,9 @@
 #include <SSLClient.h>
 #include <NTPClient.h>
 #include "trust_anchors.h" // dibuat dengan pycert_bearssl.py: array TAs dan konstanta TAs_NUM
+
+// Config initiation
+using namespace config;
 
 volatile bool otaDiminta = false;
 
@@ -30,9 +33,6 @@ const unsigned long POLL_PILIH_MS = 300000; // 5 menit (sebelumnya 2 menit)
 const unsigned long POLL_KOSONG_MS = 8000;
 const unsigned long IDLE_SEBELUM_POLL_MS = 5000; // operator harus diam 5 dtk (sebelumnya 2 dtk)
 
-// Timeout satu request HTTPS (sebelumnya bawaan SSLClient 30 dtk)
-const unsigned int SSL_TIMEOUT_MS = 8000;
-
 const int MAX_PUTARAN_PER_SISI = 2;
 
 const int ERR_ETH_PUTUS = -100;
@@ -47,7 +47,6 @@ PubSubClient client(ethClient);
 //  - httpSSL   : HTTPS lewat SSLClient (BearSSL) di atas httpBase
 //  PIN_ENTROPI harus pin analog yang TIDAK tersambung ke apa pun.
 // =====================================================
-const int PIN_ENTROPI = 34;
 
 EthernetClient httpPlain;
 EthernetClient httpBase;
@@ -63,15 +62,7 @@ unsigned long ntpCobaMs = 0;
 // =====================================================
 //  LCD I2C (20x4)
 // =====================================================
-LiquidCrystal_I2C lcd(0x27, 20, 4);
-
-// =====================================================
-//  DEFINISI PIN HARDWARE
-// =====================================================
-const int PIN_CLK = 32;
-const int PIN_DT = 35;      // GPIO35 input-only, TIDAK punya pull-up internal: pasang 10k ke 3V3
-const int PIN_SW = 5;       // Rotary Encoder Button (OK)
-const int PIN_BTN_PIN4 = 4; // Tombol fisik tunggal (BACK)
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMN, LCD_ROW);
 
 // =====================================================
 //  ENCODER (HARDWARE PCNT)
@@ -294,17 +285,6 @@ const unsigned long TAHAN_BATAL_MS = 3000; // tahan BACK sekian ms untuk batal
 unsigned long backTahanMulai = 0;
 
 bool otaManual = false;
-
-const unsigned long ETH_CHECK_INTERVAL = 3000UL;
-const unsigned long DHCP_RETRY_INTERVAL = 15000UL;
-const unsigned long MQTT_RETRY_MIN = 2000UL;
-const unsigned long MQTT_RETRY_MAX = 60000UL;
-const unsigned long HEARTBEAT_INTERVAL = 5000UL; // dashboard anggap OFFLINE jika > 15 detik
-const unsigned long DIAG_INTERVAL = 60000UL;
-const unsigned long RESET_ETH_AFTER = 5UL * 60UL * 1000UL;
-const unsigned long RESTART_AFTER = 10UL * 60UL * 1000UL;
-const uint8_t LINK_OFF_CONFIRM = 2;
-const uint32_t WDT_TIMEOUT_S = 60;
 
 enum NetState : uint8_t
 {
@@ -674,7 +654,9 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 bool mqttTryConnect()
 {
   ethClient.stop();
-  String clientId = "ESP32Sanding-" + macString();
+  String macPolos = macString();
+  macPolos.replace(":", "");
+  String clientId = String(clientIdPrefix) + macPolos;
   unsigned long t0 = millis();
   bool ok = client.connect(clientId.c_str(), topicHmiStatus, 0, true, "0");
   unsigned long dur = millis() - t0;
@@ -788,7 +770,7 @@ void batalkanPutaran()
   hentikanHitungSensor();
 
   // Tunggu tombol dilepas supaya tidak "tembus" ke layar berikutnya
-  while (digitalRead(PIN_BTN_PIN4) == LOW)
+  while (digitalRead(PIN_BTN) == LOW)
   {
     esp_task_wdt_reset();
     if (client.connected())
@@ -1682,7 +1664,7 @@ void setup()
 
   // Tombol OK dan BACK tetap dibaca biasa. CLK/DT dikelola ESP32Encoder (PCNT).
   pinMode(PIN_SW, INPUT_PULLUP);
-  pinMode(PIN_BTN_PIN4, INPUT_PULLUP);
+  pinMode(PIN_BTN, INPUT_PULLUP);
   pinMode(PIN_CLK, INPUT_PULLUP);
   pinMode(PIN_DT, INPUT_PULLUP); // GPIO35 tidak punya pull-up internal: tetap pakai 10k eksternal
   encPrevCLK = digitalRead(PIN_CLK);
@@ -1693,8 +1675,8 @@ void setup()
   lcd.print("MENYIAPKAN ETHERNET...");
 
   // Inisialisasi SPI W5500 (SCK=18, MISO=23, MOSI=19, SS=16)
-  SPI.begin(18, 23, 19, ETHERNET_CS_PIN);
-  Ethernet.init(ETHERNET_CS_PIN);
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, CS_PIN);
+  Ethernet.init(CS_PIN);
 
   siapkanMac();
   Serial.println("MAC perangkat: " + macString());
@@ -2330,7 +2312,7 @@ void handlePilihSisiMenu()
     updateDisplayPilihSisi();
   }
 
-  if (digitalRead(PIN_BTN_PIN4) == LOW)
+  if (digitalRead(PIN_BTN) == LOW)
   {
     delay(300);
     currentState = STATE_PILIH_DATA;
@@ -2451,7 +2433,7 @@ void handleSandingRunning()
   // Pembatalan darurat hanya lewat tahan lama (TAHAN_BATAL_MS).
   if (IZINKAN_BATAL_TAHAN)
   {
-    if (digitalRead(PIN_BTN_PIN4) == LOW)
+    if (digitalRead(PIN_BTN) == LOW)
     {
       if (backTahanMulai == 0)
         backTahanMulai = millis();
@@ -2514,7 +2496,7 @@ void handleKoreksiManual()
     updateDisplayKoreksi();
   }
 
-  if (digitalRead(PIN_BTN_PIN4) == LOW)
+  if (digitalRead(PIN_BTN) == LOW)
   {
     delay(300);
     if (koreksiField == 1)
@@ -2583,7 +2565,7 @@ void handleValidasiMenu()
     updateDisplayValidasi();
   }
 
-  if (digitalRead(PIN_BTN_PIN4) == LOW)
+  if (digitalRead(PIN_BTN) == LOW)
   {
     delay(300);
     if (adaKoreksiManual)

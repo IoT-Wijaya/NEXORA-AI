@@ -1,0 +1,11 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Tabel partisi ESP32 untuk input-display (HMI sanding).
+# Dukung OTA: satu slot factory + dua slot OTA (ota_0, ota_1).
+# Flash total 4 MB (NodeMCU-32S); aplikasi 3 x 1 MB + partisi data kecil.
+nvs,      data, nvs,     ,        0x4000,
+otadata,  data, ota,     ,        0x2000,
+phy_init, data, phy,     ,        0x1000,
+factory,  app,  factory, ,        1M,
+ota_0,    app,  ota_0,   ,        1M,
+ota_1,    app,  ota_1,   ,        1M,
+eeprom,   data, 0x99,    ,        0x1000,

@@ -361,7 +361,7 @@ void cekSemuaPin()
     hwCekPin("CLK", PIN_CLK);
     hwCekPin("DT", PIN_DT);
     hwCekPin("OK", PIN_SW);
-    hwCekPin("BACK", PIN_BTN_PIN4);
+    hwCekPin("BACK", PIN_BTN);
     if (PIN_CLK >= 34 || PIN_DT >= 34)
         Serial.println("[HW] CATATAN: GPIO34-39 hanya-input dan TIDAK punya pull-up internal; "
                        "INPUT_PULLUP tidak berefek. Pastikan ada pull-up eksternal (10k ke 3V3) "
