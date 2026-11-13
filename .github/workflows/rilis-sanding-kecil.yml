@@ -1,0 +1,159 @@
+name: Rilis Firmware Sanding Kecil
+
+# Dipicu tag sanding-kecil-vX.Y.Z (pola ketat diperiksa tools/ci_rilis.py).
+# Alur: tes -> build -> manifest bertanda tangan -> pasang di VPS -> verifikasi dari luar -> GitHub Release.
+on:
+  push:
+    tags:
+      - "sanding-kecil-v*"
+
+permissions:
+  contents: read
+
+# Satu rilis pada satu waktu; rilis kedua menunggu, tidak dibatalkan di tengah jalan.
+concurrency:
+  group: rilis-sanding-kecil
+  cancel-in-progress: false
+
+env:
+  PLATFORMIO_VERSION: "6.1.18" # samakan dengan `pio --version` di komputer Anda
+  PIO_ENV: sanding_kecil
+
+jobs:
+  tes:
+    name: Tes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ env.PLATFORMIO_VERSION }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Pasang PlatformIO
+        run: pip install "platformio==${PLATFORMIO_VERSION}"
+
+      - name: Tes native firmware
+        run: pio test -e native
+
+      - name: Tes alat rilis (Python)
+        run: python3 -m unittest discover -s tools -p "test_*.py" -v
+
+      - name: Tes pemasangan di VPS (rilis nyata di folder sementara)
+        run: bash tools/test_pasang_di_vps.sh
+
+  rilis:
+    name: Build, tanda tangan, pasang
+    needs: tes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: rilis # pasang "Required reviewers" di Settings > Environments bila ingin persetujuan manual
+    permissions:
+      contents: write # hanya untuk membuat GitHub Release
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_FW_DIR: ${{ vars.VPS_FW_DIR }}
+      OTA_PUBLIC_HOST: ${{ vars.OTA_PUBLIC_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # jumlah commit untuk nomor build, dan riwayat untuk cek cabang main
+          persist-credentials: false
+
+      - name: Pastikan tag berada di riwayat main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "GAGAL: tag $GITHUB_REF_NAME tidak berada di riwayat main"; exit 1; }
+
+      - name: Tentukan versi dan nomor build
+        run: |
+          python3 tools/ci_rilis.py versi --tag "$GITHUB_REF_NAME" --commits "$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ env.PLATFORMIO_VERSION }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Pasang PlatformIO
+        run: pip install "platformio==${PLATFORMIO_VERSION}"
+
+      - name: Build firmware
+        run: |
+          echo "Membangun $FW_VERSION (build $FW_BUILD)"
+          pio run -e "$PIO_ENV"
+          cp ".pio/build/$PIO_ENV/firmware.bin" firmware.bin
+
+      - name: Pastikan versi benar-benar tertanam di biner
+        run: |
+          grep -aqF "$FW_VERSION" firmware.bin \
+            || { echo "GAGAL: $FW_VERSION tidak ditemukan di firmware.bin"; exit 1; }
+
+      - name: Buat dan tanda tangani manifest
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+        run: |
+          umask 077
+          KEY="$RUNNER_TEMP/ota_rahasia.pem"
+          printf '%s\n' "$OTA_SIGNING_KEY" > "$KEY"
+          python3 tools/make_manifest.py firmware.bin --version "$FW_VERSION" --build "$FW_BUILD" -o manifest.json
+          bash tools/sign_manifest.sh manifest.json "$KEY" manifest.signed
+
+      - name: Hapus kunci rahasia dari runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ota_rahasia.pem"
+
+      - name: Siapkan SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host vps\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n  BatchMode yes\n  StrictHostKeyChecking yes\n' \
+            "$VPS_HOST" "$VPS_USER" > ~/.ssh/config
+
+      - name: Pastikan nomor build lebih besar dari yang terpasang
+        run: |
+          rm -f terpasang.signed
+          if ssh vps "test -f '$VPS_FW_DIR/manifest.signed'"; then
+            scp -q "vps:$VPS_FW_DIR/manifest.signed" terpasang.signed
+          fi
+          python3 tools/ci_rilis.py cek-naik --baru "$FW_BUILD" --terpasang terpasang.signed
+
+      - name: Pasang di VPS
+        run: |
+          MASUK="ota-masuk/$FW_BUILD"
+          ssh vps "rm -rf '$MASUK' && mkdir -p '$MASUK'"
+          scp -q firmware.bin manifest.signed tools/pasang_di_vps.sh "vps:$MASUK/"
+          ssh vps "bash '$MASUK/pasang_di_vps.sh' '$MASUK' '$VPS_FW_DIR' 10"
+          ssh vps "rm -rf '$MASUK'"
+
+      - name: Verifikasi dari luar (HTTP port 80, tanpa pengalihan)
+        run: |
+          for berkas in manifest.signed firmware.bin; do
+            curl --fail --silent --show-error --max-redirs 0 --max-time 60 \
+              "http://$OTA_PUBLIC_HOST/fw/$berkas" -o "diunduh-$berkas"
+            cmp "$berkas" "diunduh-$berkas" || { echo "GAGAL: $berkas di server berbeda dari hasil build"; exit 1; }
+          done
+
+      - name: Buat GitHub Release
+        run: |
+          SHA="$(sha256sum firmware.bin | cut -d' ' -f1)"
+          gh release create "$GITHUB_REF_NAME" firmware.bin manifest.signed \
+            --verify-tag \
+            --title "Sanding Kecil $FW_VERSION (build $FW_BUILD)" \
+            --notes "Build $FW_BUILD, sha256 firmware: $SHA"
