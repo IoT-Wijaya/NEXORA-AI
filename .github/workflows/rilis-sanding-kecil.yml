@@ -15,6 +15,12 @@ concurrency:
   group: rilis-sanding-kecil
   cancel-in-progress: false
 
+# Semua perintah run berjalan di folder proyek PlatformIO (tempat platformio.ini dan tools/ berada).
+# GANTI_FOLDER dengan nama folder itu; ganti juga pada dua baris hashFiles di bawah.
+defaults:
+  run:
+    working-directory: GANTI_FOLDER
+
 env:
   PLATFORMIO_VERSION: "6.1.18" # samakan dengan `pio --version` di komputer Anda
   PIO_ENV: sanding_kecil
@@ -34,7 +40,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.platformio
-          key: pio-${{ runner.os }}-${{ env.PLATFORMIO_VERSION }}-${{ hashFiles('platformio.ini') }}
+          key: pio-${{ runner.os }}-${{ env.PLATFORMIO_VERSION }}-${{ hashFiles('GANTI_FOLDER/platformio.ini') }}
 
       - name: Pasang PlatformIO
         run: pip install "platformio==${PLATFORMIO_VERSION}"
@@ -60,6 +66,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       VPS_HOST: ${{ secrets.VPS_HOST }}
       VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PORT: ${{ vars.VPS_PORT }} # kosong = 22
       VPS_FW_DIR: ${{ vars.VPS_FW_DIR }}
       OTA_PUBLIC_HOST: ${{ vars.OTA_PUBLIC_HOST }}
     steps:
@@ -84,7 +91,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.platformio
-          key: pio-${{ runner.os }}-${{ env.PLATFORMIO_VERSION }}-${{ hashFiles('platformio.ini') }}
+          key: pio-${{ runner.os }}-${{ env.PLATFORMIO_VERSION }}-${{ hashFiles('GANTI_FOLDER/platformio.ini') }}
 
       - name: Pasang PlatformIO
         run: pip install "platformio==${PLATFORMIO_VERSION}"
@@ -123,11 +130,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
           printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          printf 'Host vps\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n  BatchMode yes\n  StrictHostKeyChecking yes\n' \
-            "$VPS_HOST" "$VPS_USER" > ~/.ssh/config
+          printf 'Host vps\n  HostName %s\n  Port %s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n  BatchMode yes\n  StrictHostKeyChecking yes\n' \
+            "$VPS_HOST" "${VPS_PORT:-22}" "$VPS_USER" > ~/.ssh/config
 
       - name: Pastikan nomor build lebih besar dari yang terpasang
         run: |
+          # Variabel di dalam perintah ssh sengaja diperluas di sisi runner (nilainya dari konfigurasi tepercaya).
           rm -f terpasang.signed
           if ssh vps "test -f '$VPS_FW_DIR/manifest.signed'"; then
             scp -q "vps:$VPS_FW_DIR/manifest.signed" terpasang.signed
@@ -136,6 +144,7 @@ jobs:
 
       - name: Pasang di VPS
         run: |
+          # Variabel di dalam perintah ssh sengaja diperluas di sisi runner (nilainya dari konfigurasi tepercaya).
           MASUK="ota-masuk/$FW_BUILD"
           ssh vps "rm -rf '$MASUK' && mkdir -p '$MASUK'"
           scp -q firmware.bin manifest.signed tools/pasang_di_vps.sh "vps:$MASUK/"
