@@ -133,6 +133,12 @@ jobs:
           printf 'Host vps\n  HostName %s\n  Port %s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n  BatchMode yes\n  StrictHostKeyChecking yes\n' \
             "$VPS_HOST" "${VPS_PORT:-22}" "$VPS_USER" > ~/.ssh/config
 
+      - name: Diagnosis sementara
+        run: |
+          echo "jumlah baris known_hosts: $(wc -l < ~/.ssh/known_hosts)"
+          echo "tipe kunci: $(awk '{print $2}' ~/.ssh/known_hosts | tr '\n' ' ')"
+          ssh-keygen -F "[$VPS_HOST]:${VPS_PORT:-22}" > /dev/null && echo "ENTRI DITEMUKAN" || echo "ENTRI TIDAK ADA untuk host:port ini"
+
       - name: Pastikan nomor build lebih besar dari yang terpasang
         run: |
           # Variabel di dalam perintah ssh sengaja diperluas di sisi runner (nilainya dari konfigurasi tepercaya).
