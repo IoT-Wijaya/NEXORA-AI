@@ -2,16 +2,35 @@
 #include <SPI.h>
 #include <Ethernet.h>
 #include <PubSubClient.h>
-#include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
+
+#include "sanding_config.h"
+#include "build_info.h"
 #include "secrets.h"
-#include "sanding_besar.h"
+#include "sensor_filter.h"
+#include "counter_store.h"
+#include "esp_spin_lock.h"
+#include "esp_task_watchdog.h"
+#include "command_parser.h"
+#include "net_monitor.h"
+#include "w5500_driver.h"
+#include "pubsub_mqtt_client.h"
+#include "mqtt_service.h"
+#include "lcd_view.h"
+#include "i2c_lcd_display.h"
+#include "device_identity.h"
+#include "fixed_mac_source.h"
+#include "device_config.h"
+#include "console_shell.h"
+#include "nvs_config_store.h"
+#include "firmware_info.h"
 
 using namespace config;
+
 // =====================================================
-// SANDING BESAR - ESP32 + W5500 + LCD 20x4 + MQTT VPS
+// SANDING BESAR - ESP32 + W5500 + LCD 20x4 + MQTT
 // -----------------------------------------------------
 // sensorTask  (core 0): HANYA menghitung sensor & tombol reset.
 //                       Tidak menyentuh MQTT, LCD, atau flash.
@@ -19,195 +38,109 @@ using namespace config;
 //
 // Dua task tidak boleh memakai objek yang sama
 // (client MQTT, LCD) karena library-nya tidak thread-safe.
-// Komunikasi antar task lewat counter + bendera counterDirty.
+// Komunikasi antar task lewat CounterStore (dilindungi mutex).
 //
 // LAPISAN KESTABILAN:
 //  1. Backoff      : jeda konek ulang MQTT 2s -> 4s -> ... -> 60s
 //  2. Reset chip   : MQTT/IP bermasalah > 5 menit -> reset W5500
 //  3. Restart total: MQTT/IP bermasalah > 10 menit -> ESP.restart()
 //  4. Watchdog     : task macet > 60 detik -> restart otomatis
-//  5. Counter disimpan di flash, jadi restart tidak meDnghapus hitungan
-//  6. Satu fungsi status (hitungNetState) dipakai LCD DAN dashboard
+//  5. Counter disimpan di flash, jadi restart tidak menghapus hitungan
+//  6. Satu fungsi status (hitungNetState) dipakai LCD dan laporan diagnosa
 // =====================================================
 
 // =====================================================
-// KONFIGURASI LCD 20x4
+// KOMPONEN GLOBAL (konstruktor tidak berbuat banyak,
+// inisialisasi nyata terjadi di setup())
 // =====================================================
-LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 
-// MAC harus UNIK di jaringan. Sanding Kecil memakai ...FE:02.
-byte mac[] = DEVICE_MAC;
+// Konfigurasi runtime (MQTT host/port/user/pass, nama mesin) via NVS.
+NvsConfigStore configStore;
+ConfigManager configManager(configStore, config::namaMesin, config::MQTT_DEFAULT_PORT);
+DeviceConfig deviceConfig; // diisi sekali di setup(), sesudahnya hanya dibaca
+
+ConsoleShell serialConsole(
+    configManager,
+    [](const char *baris)
+    { Serial.println(baris); },
+    []()
+    { delay(300); ESP.restart(); });
+
+// LCD I2C 20x4 dan logika halamannya.
+I2cLcdDisplay lcdDisplay;
+LcdView lcdView(lcdDisplay, deviceConfig.machineName, LCD_PAGE_INTERVAL);
+
+// MAC address dari include/secrets.h, lalu Client ID MQTT.
+FixedMacSource macSource;
+DeviceIdentity identity(macSource, config::clientIdPrefix);
+
+// Jaringan W5500 + monitoring DHCP/link.
+W5500Driver ethDriver(identity);
+NetMonitor netMonitor(ethDriver, DHCP_RETRY_INTERVAL);
+
+// Klien MQTT (PubSubClient dibungkus agar sesuai antarmuka IMqttClient).
 EthernetClient ethClient;
-PubSubClient client(ethClient);
-
-volatile bool hitungAktif = false;
-volatile uint8_t cmdTertunda = 0;
-// Isi topik status (sama dengan kode lama)
-#define STATUS_ONLINE "1"
-#define STATUS_OFFLINE "0"
-
-#define FW_VERSION "2026.10.17"
-
-// Sensor aktif LOW
-#define SENSOR_ACTIVE LOW
-
-// Watchdog: task yang tidak "lapor hidup" selama ini -> ESP32 restart
-const uint32_t WDT_TIMEOUT_S = 60;
-
-// =====================================================
-// PENYIMPANAN COUNTER KE FLASH
-// true  = hitungan dilanjutkan setelah restart / mati listrik
-// false = hitungan selalu mulai dari 0 setelah restart
-// =====================================================
-const bool SIMPAN_COUNTER_FLASH = true;
-const unsigned long SAVE_INTERVAL = 10000UL; // simpan maks tiap 10 detik
-
-Preferences prefs;
-bool perluSimpan = false;
-unsigned long lastSave = 0;
+PubSubMqttClient mqttClient(ethClient);
+MqttService mqtt(mqttClient);
 
 // =====================================================
 // COUNTER (dibagi antar task, selalu diakses lewat mutex)
 // =====================================================
-volatile unsigned long jumlahHasil = 0; // Sensor 1
-volatile unsigned long jumlahModal = 0; // Sensor 2
+EspSpinLock counterLock;
+CounterStore counters(counterLock);
 
-// Bendera: "ada perubahan counter, tolong publish & update LCD"
-volatile bool counterDirty = false;
-
-portMUX_TYPE counterMux = portMUX_INITIALIZER_UNLOCKED;
+// Versi firmware (dari tools/version.py via build_info.h).
+FirmwareInfo firmwareInfo(FW_VERSION, FW_BUILD);
 
 // =====================================================
-// STATUS JARINGAN (hanya diubah oleh networkTask)
+// STATUS PENCACAHAN (hanya diubah oleh networkTask,
+// kecuali hitungAktif juga dibaca oleh sensorTask)
 // =====================================================
-volatile bool linkUp = false; // kabel terpasang
-volatile bool lanOK = false;  // kabel terpasang DAN punya IP
-volatile bool mqttOK = false;
-volatile int mqttErr = -1; // hasil client.state() terakhir
-
-// -----------------------------------------------------
-// SATU SUMBER KEBENARAN STATUS
-// Fungsi hitungNetState() dipakai oleh LCD DAN laporan ke dashboard,
-// jadi keduanya pasti sama.
-// -----------------------------------------------------
-enum NetState : uint8_t
-{
-  NS_KABEL_PUTUS = 0, // paling parah
-  NS_TANPA_IP = 1,
-  NS_MQTT_NG = 2,
-  NS_ONLINE = 3
-};
-
-// Riwayat gangguan (dilaporkan ke dashboard setelah koneksi pulih)
-bool pernahOnline = false;
-unsigned long outageStart = 0;
-NetState outageCause = NS_ONLINE;
-unsigned long lastOutageSec = 0;
-NetState lastOutageCause = NS_ONLINE;
-int lastErrSeen = 0;     // kode error MQTT terakhir yang bukan 0
-bool diagSegera = false; // minta kirim laporan diag secepatnya
-unsigned long lastDiag = 0;
-
-uint32_t lanLostCount = 0;
-uint32_t mqttLostCount = 0;
-uint8_t linkOffSamples = 0;
-
-unsigned long lastEthCheck = 0;
-unsigned long lastDhcpTry = 0;
-unsigned long lastMQTTReconnect = 0;
-unsigned long lastHeartbeat = 0;
-unsigned long lastReport = 0;
-
-unsigned long mqttRetryDelay = MQTT_RETRY_MIN;
-
-// Pelacak lama masalah (untuk pemulihan bertingkat)
-unsigned long problemSince = 0;
-bool sudahResetEth = false;
-
-// =====================================================
-// DATA FILTER SENSOR
-// Satu struct dipakai untuk semua sensor (tidak ditulis ulang)
-// =====================================================
-struct Sensor
-{
-  uint8_t pin;
-  bool state;   // status stabil setelah filter
-  bool lastRaw; // pembacaan mentah terakhir
-  unsigned long changeTime;
-};
-
-Sensor sensorHasil = {SENSOR_HASIL, HIGH, HIGH, 0};
-Sensor sensorModal = {SENSOR_MODAL, HIGH, HIGH, 0};
-
-// =====================================================
-// HELPER COUNTER
-// =====================================================
-void bacaCounter(unsigned long &hasil, unsigned long &modal)
-{
-  portENTER_CRITICAL(&counterMux);
-  hasil = jumlahHasil;
-  modal = jumlahModal;
-  portEXIT_CRITICAL(&counterMux);
-}
-
-void resetCounters(bool resetHasil, bool resetModal)
-{
-  portENTER_CRITICAL(&counterMux);
-  if (resetHasil)
-  {
-    jumlahHasil = 0;
-  }
-  if (resetModal)
-  {
-    jumlahModal = 0;
-  }
-  portEXIT_CRITICAL(&counterMux);
-
-  counterDirty = true;
-}
+volatile bool hitungAktif = HITUNG_OTOMATIS;
+volatile uint8_t cmdTertunda = 0;
+const char *ackPesan = nullptr; // "START_OK", "STOP_OK", "RESET_OK"
 
 // =====================================================
 // FLASH (NVS): simpan & muat counter
 // Hanya dipanggil dari setup() dan networkTask.
 // =====================================================
+Preferences prefs;
+bool perluSimpan = false;
+unsigned long lastSave = 0;
+
 void simpanCounter()
 {
-  if (!SIMPAN_COUNTER_FLASH)
-  {
-    return;
-  }
+    if (!SIMPAN_COUNTER_FLASH)
+    {
+        return;
+    }
 
-  unsigned long hasil;
-  unsigned long modal;
-  bacaCounter(hasil, modal);
+    const CounterSnapshot c = counters.snapshot();
 
-  prefs.begin("counter", false);
-  prefs.putULong("hasil", hasil);
-  prefs.putULong("modal", modal);
-  prefs.end();
+    prefs.begin("counter", false);
+    prefs.putULong("hasil", c.hasil);
+    prefs.putULong("modal", c.modal);
+    prefs.end();
 }
 
 void muatCounter()
 {
-  if (!SIMPAN_COUNTER_FLASH)
-  {
-    return;
-  }
+    if (!SIMPAN_COUNTER_FLASH)
+    {
+        return;
+    }
 
-  prefs.begin("counter", true);
-  unsigned long hasil = prefs.getULong("hasil", 0);
-  unsigned long modal = prefs.getULong("modal", 0);
-  prefs.end();
+    prefs.begin("counter", true);
+    const uint32_t hasil = prefs.getULong("hasil", 0);
+    const uint32_t modal = prefs.getULong("modal", 0);
+    prefs.end();
 
-  portENTER_CRITICAL(&counterMux);
-  jumlahHasil = hasil;
-  jumlahModal = modal;
-  portEXIT_CRITICAL(&counterMux);
+    counters.set(hasil, modal);
 
-  Serial.print("Counter dimuat dari flash: HASIL=");
-  Serial.print(hasil);
-  Serial.print(" MODAL=");
-  Serial.println(modal);
+    Serial.print("Counter dimuat dari flash: HASIL=");
+    Serial.print(hasil);
+    Serial.print(" MODAL=");
+    Serial.println(modal);
 }
 
 // =====================================================
@@ -215,40 +148,30 @@ void muatCounter()
 // =====================================================
 void restartDevice(const char *alasan)
 {
-  Serial.print("RESTART ESP32, alasan: ");
-  Serial.println(alasan);
+    Serial.print("RESTART ESP32, alasan: ");
+    Serial.println(alasan);
 
-  simpanCounter();
+    simpanCounter();
 
-  if (client.connected())
-  {
-    client.publish(topicStatus, STATUS_OFFLINE, true);
-    client.disconnect();
-  }
+    if (mqtt.isConnected())
+    {
+        ethClient.publish(topicStatus, STATUS_OFFLINE, true);
+        mqttClient.disconnect();
+    }
 
-  delay(300);
-  ESP.restart();
+    delay(300);
+    ESP.restart();
 }
 
 // =====================================================
-// WATCHDOG
-// Mendukung Arduino-ESP32 versi 2.x dan 3.x
+// WATCHDOG (menggunakan EspTaskWatchdog dari src/)
 // =====================================================
 void aktifkanWatchdog()
 {
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  esp_task_wdt_config_t cfg = {
-      .timeout_ms = WDT_TIMEOUT_S * 1000,
-      .idle_core_mask = 0,
-      .trigger_panic = true};
-
-  if (esp_task_wdt_reconfigure(&cfg) != ESP_OK)
-  {
-    esp_task_wdt_init(&cfg);
-  }
-#else
-  esp_task_wdt_init(WDT_TIMEOUT_S, true);
-#endif
+    if (!EspTaskWatchdog::begin(WDT_TIMEOUT_S))
+    {
+        Serial.println("PERINGATAN: watchdog tugas gagal diatur.");
+    }
 }
 
 // =====================================================
@@ -256,504 +179,329 @@ void aktifkanWatchdog()
 // =====================================================
 const char *namaErrorMQTT(int kode)
 {
-  switch (kode)
-  {
-  case -4:
-    return "TIMEOUT";
-  case -3:
-    return "LOST";
-  case -2:
-    return "GAGAL";
-  case -1:
-    return "PUTUS";
-  case 0:
-    return "OK";
-  case 1:
-    return "PROTOK";
-  case 2:
-    return "CLIENT";
-  case 3:
-    return "BUSY";
-  case 4:
-    return "PASSWD";
-  case 5:
-    return "NOAKSES";
-  default:
-    return "???";
-  }
+    switch (kode)
+    {
+    case -4:
+        return "TIMEOUT";
+    case -3:
+        return "LOST";
+    case -2:
+        return "GAGAL";
+    case -1:
+        return "PUTUS";
+    case 0:
+        return "OK";
+    case 1:
+        return "PROTOK";
+    case 2:
+        return "CLIENT";
+    case 3:
+        return "BUSY";
+    case 4:
+        return "PASSWD";
+    case 5:
+        return "NOAKSES";
+    default:
+        return "???";
+    }
 }
 
 // =====================================================
 // STATUS JARINGAN (satu fungsi untuk LCD dan dashboard)
 // =====================================================
-NetState hitungNetState()
+enum NetState : uint8_t
 {
-  if (!linkUp)
-  {
-    return NS_KABEL_PUTUS;
-  }
-  if (!lanOK)
-  {
-    return NS_TANPA_IP;
-  }
-  if (!mqttOK)
-  {
-    return NS_MQTT_NG;
-  }
-  return NS_ONLINE;
-}
+    NS_KABEL_PUTUS = 0, // paling parah
+    NS_TANPA_IP = 1,
+    NS_MQTT_NG = 2,
+    NS_ONLINE = 3
+};
 
 const char *namaNetState(NetState ns)
 {
-  switch (ns)
-  {
-  case NS_KABEL_PUTUS:
-    return "KABEL_PUTUS";
-  case NS_TANPA_IP:
-    return "TANPA_IP";
-  case NS_MQTT_NG:
-    return "MQTT_NG";
-  default:
-    return "NONE";
-  }
+    switch (ns)
+    {
+    case NS_KABEL_PUTUS:
+        return "KABEL_PUTUS";
+    case NS_TANPA_IP:
+        return "TANPA_IP";
+    case NS_MQTT_NG:
+        return "MQTT_NG";
+    default:
+        return "ONLINE";
+    }
 }
 
-// Penyebab ESP32 terakhir menyala/restart
-const char *namaResetReason()
+NetState hitungNetState(bool linkUp, bool hasIP, bool mqttOk)
 {
-  switch (esp_reset_reason())
-  {
-  case ESP_RST_POWERON:
-    return "POWER";
-  case ESP_RST_SW:
-    return "SOFTWARE";
-  case ESP_RST_PANIC:
-    return "PANIC";
-  case ESP_RST_INT_WDT:
-  case ESP_RST_TASK_WDT:
-  case ESP_RST_WDT:
-    return "WATCHDOG";
-  case ESP_RST_BROWNOUT:
-    return "BROWNOUT";
-  default:
-    return "LAINNYA";
-  }
+    if (!linkUp)
+        return NS_KABEL_PUTUS;
+    if (!hasIP)
+        return NS_TANPA_IP;
+    if (!mqttOk)
+        return NS_MQTT_NG;
+    return NS_ONLINE;
 }
 
-// Laporan lengkap ke dashboard. Hanya bisa terkirim saat MQTT hidup,
-// jadi isinya adalah RIWAYAT (apa yang terjadi saat putus tadi).
+// MAC W5500 (unik di jaringan, sama untuk driver dan pemulihan chip).
+uint8_t mac[6] = DEVICE_MAC;
+
+// Riwayat gangguan (dilaporkan ke dashboard setelah koneksi pulih)
+bool pernahOnline = false;
+unsigned long outageStart = 0;
+NetState outageCause = NS_ONLINE;
+unsigned long lastOutageSec = 0;
+NetState lastOutageCause = NS_ONLINE;
+int lastErrSeen = 0;         // kode error MQTT terakhir yang bukan 0
+bool diagSegera = false;     // minta kirim laporan diag secepatnya
+unsigned long lastDiag = 0;
+
+uint32_t lanLostCount = 0;
+uint32_t mqttLostCount = 0;
+uint8_t linkOffSamples = 0;
+
+unsigned long lastEthCheck = 0;
+
+// Pelacak lama masalah (untuk pemulihan bertingkat)
+unsigned long problemSince = 0;
+bool sudahResetEth = false;
+
+unsigned long lastReport = 0;
+NetState lastLcdState = NS_ONLINE;
+
+// =====================================================
+// LAPORAN DIAGNOSA (JSON, retained, ke topik diag)
+// =====================================================
 void publishDiag()
 {
-  if (!client.connected())
-  {
-    return;
-  }
+    if (!mqtt.isConnected())
+    {
+        return;
+    }
 
-  IPAddress ip = Ethernet.localIP();
+    const Ip4 ip = ethDriver.localIP();
 
-  char buf[400];
-  snprintf(
-      buf,
-      sizeof(buf),
-      "{\"last_outage_s\":%lu,\"last_outage_cause\":\"%s\","
-      "\"last_err\":%d,\"last_err_name\":\"%s\","
-      "\"lan_lost\":%lu,\"mqtt_lost\":%lu,"
-      "\"reset\":\"%s\",\"up_min\":%lu,\"heap\":%lu,"
-      "\"ip\":\"%u.%u.%u.%u\",\"fw\":\"%s\"}",
-      lastOutageSec,
-      namaNetState(lastOutageCause),
-      lastErrSeen,
-      namaErrorMQTT(lastErrSeen),
-      (unsigned long)lanLostCount,
-      (unsigned long)mqttLostCount,
-      namaResetReason(),
-      millis() / 60000UL,
-      (unsigned long)ESP.getFreeHeap(),
-      ip[0], ip[1], ip[2], ip[3],
-      FW_VERSION);
+    char buf[400];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "{\"last_outage_s\":%lu,\"last_outage_cause\":\"%s\","
+        "\"last_err\":%d,\"last_err_name\":\"%s\","
+        "\"lan_lost\":%lu,\"mqtt_lost\":%lu,"
+        "\"reset\":\"%s\",\"up_min\":%lu,\"heap\":%lu,"
+        "\"ip\":\"%u.%u.%u.%u\",\"fw\":\"%s\"}",
+        lastOutageSec,
+        namaNetState(lastOutageCause),
+        lastErrSeen,
+        namaErrorMQTT(lastErrSeen),
+        (unsigned long)lanLostCount,
+        (unsigned long)mqttLostCount,
+        namaResetReason(),
+        millis() / 60000UL,
+        (unsigned long)ESP.getFreeHeap(),
+        ip.b[0], ip.b[1], ip.b[2], ip.b[3],
+        firmwareInfo.version());
 
-  client.publish(topicDiag, buf, true);
+    mqtt.publishDiag(buf);
+}
+
+const char *namaResetReason()
+{
+    switch (esp_reset_reason())
+    {
+    case ESP_RST_POWERON:
+        return "POWER";
+    case ESP_RST_SW:
+        return "SOFTWARE";
+    case ESP_RST_PANIC:
+        return "PANIC";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+        return "WATCHDOG";
+    case ESP_RST_BROWNOUT:
+        return "BROWNOUT";
+    default:
+        return "LAINNYA";
+    }
 }
 
 // =====================================================
 // LCD 20x4 (hanya dipanggil dari networkTask dan setup)
 // =====================================================
-void lcdTulisBaris(uint8_t baris, const char *teks)
-{
-  char buf[LCD_COLUMNS + 1];
-
-  // "%-20s" = rata kiri, sisa kolom diisi spasi (menghapus sisa karakter lama)
-  snprintf(buf, sizeof(buf), "%-20s", teks);
-
-  lcd.setCursor(0, baris);
-  lcd.print(buf);
-}
-
 void updateLCD()
 {
-  unsigned long hasil;
-  unsigned long modal;
-  bacaCounter(hasil, modal);
+    const CounterSnapshot c = counters.snapshot();
 
-  char baris0[LCD_COLUMNS + 1];
-  char baris1[LCD_COLUMNS + 1];
-  char baris2[LCD_COLUMNS + 1];
-  char baris3[LCD_COLUMNS + 1];
+    char ipText[21] = "";
+    if (ethDriver.hasIP())
+    {
+        formatIp(ethDriver.localIP(), ipText, sizeof(ipText));
+    }
 
-  // Baris 0 & 1: status dihitung oleh fungsi yang SAMA dengan dashboard
-  switch (hitungNetState())
-  {
-  case NS_KABEL_PUTUS:
-    snprintf(baris0, sizeof(baris0), "LAN:NG (KABEL PUTUS)");
-    snprintf(baris1, sizeof(baris1), "SANDING BESAR");
-    break;
-  case NS_TANPA_IP:
-    snprintf(baris0, sizeof(baris0), "LAN:NG (TANPA IP)");
-    snprintf(baris1, sizeof(baris1), "SANDING BESAR");
-    break;
-  case NS_MQTT_NG:
-    // Contoh: "LAN:OK MQTT:NG e=-2" dan "ERR: GAGAL"
-    snprintf(baris0, sizeof(baris0), "LAN:OK MQTT:NG e=%d", mqttErr);
-    snprintf(baris1, sizeof(baris1), "ERR: %s", namaErrorMQTT(mqttErr));
-    break;
-  default:
-    snprintf(baris0, sizeof(baris0), "LAN:OK   MQTT:OK");
-    snprintf(baris1, sizeof(baris1), "SANDING BESAR");
-    break;
-  }
+    LcdState state;
+    state.hasil = c.hasil;
+    state.modal = c.modal;
+    state.counting = hitungAktif;
+    state.lanOk = netMonitor.isOnline();
+    state.mqttOk = mqtt.isConnected();
+    state.ip = ipText;
+    state.modeAktif = hitungAktif;
 
-  snprintf(baris2, sizeof(baris2), "Modal  : %lu", modal);
-  snprintf(baris3, sizeof(baris3), "Hasil  : %lu", hasil);
-
-  lcdTulisBaris(0, baris0);
-  lcdTulisBaris(1, baris1);
-  lcdTulisBaris(2, baris2);
-  lcdTulisBaris(3, baris3);
+    lcdView.render(state);
 }
 
 // =====================================================
 // MQTT PUBLISH (hanya dipanggil dari networkTask)
 // =====================================================
-void publishCounters()
+void publishKeadaanAwal()
 {
-  unsigned long hasil;
-  unsigned long modal;
-  bacaCounter(hasil, modal);
+    const CounterSnapshot c = counters.snapshot();
 
-  char buffer[16];
+    char ip[21] = "";
+    if (ethDriver.hasIP())
+    {
+        formatIp(ethDriver.localIP(), ip, sizeof(ip));
+    }
 
-  snprintf(buffer, sizeof(buffer), "%lu", hasil);
-  client.publish(topicJumlah, buffer, true);
-
-  snprintf(buffer, sizeof(buffer), "%lu", modal);
-  client.publish(topicJumlah2, buffer, true);
-}
-
-void publishIP()
-{
-  IPAddress ip = Ethernet.localIP();
-
-  char ipBuffer[20];
-  snprintf(
-      ipBuffer,
-      sizeof(ipBuffer),
-      "%u.%u.%u.%u",
-      ip[0],
-      ip[1],
-      ip[2],
-      ip[3]);
-
-  client.publish(topicIP, ipBuffer, true);
+    // Setiap MQTT tersambung dimulai putaran bukaan baru: publish jumlah,
+    // jumlah2, mode, dan IP (semua retained).
+    mqtt.publishOnConnect(c.hasil, c.modal, hitungAktif, ethDriver.hasIP() ? ip : nullptr);
 }
 
 // =====================================================
 // MQTT CALLBACK (berjalan di dalam client.loop() -> networkTask)
 // Memakai char array, bukan String, agar memori tidak terfragmentasi.
 // =====================================================
-void mqttCallback(char *topic, byte *payload, unsigned int length)
+void handleCommand(Command command)
 {
-  char command[24];
+    Serial.print("MQTT Command: ");
+    Serial.println(CommandParser::name(command));
 
-  unsigned int n = length < (sizeof(command) - 1) ? length : (sizeof(command) - 1);
-  memcpy(command, payload, n);
-  command[n] = '\0';
+    switch (command)
+    {
+    case Command::Start:
+        // Tandai permintaan START; networkTask yang melaksanakannya
+        // (memakai HITUNG_OTOMATIS dan backoff bila perlu).
+        cmdTertunda = 1;
+        Serial.println("START: permintaan ditandai");
+        break;
 
-  // Buang spasi/enter di ujung
-  while (n > 0 && isspace((unsigned char)command[n - 1]))
-  {
-    command[--n] = '\0';
-  }
+    case Command::Stop:
+        cmdTertunda = 2;
+        Serial.println("STOP: permintaan ditandai");
+        break;
 
-  Serial.print("MQTT Command: ");
-  Serial.println(command);
+    case Command::ResetHasil:
+        counters.reset(true, false);
+        ackPesan = "RESET_OK";
+        Serial.println("RESET HASIL");
+        break;
 
-  if (strcmp(command, "RESET_S1") == 0)
-  {
-    resetCounters(true, false);
-    Serial.println("RESET HASIL");
-  }
-  else if (strcmp(command, "RESET_S2") == 0)
-  {
-    resetCounters(false, true);
-    Serial.println("RESET MODAL");
-  }
-  else if (strcmp(command, "RESET_ALL") == 0 || strcmp(command, "RESET") == 0)
-  {
-    resetCounters(true, true);
-    Serial.println("RESET SEMUA");
-  }
-  else if (strcmp(command, "RESTART_DEVICE") == 0)
-  {
-    restartDevice("perintah MQTT");
-  }
-  else if (strcmp(command, "START") == 0)
-    cmdTertunda = 1;
-  else if (strcmp(command, "STOP") == 0)
-    cmdTertunda = 2;
+    case Command::ResetModal:
+        counters.reset(false, true);
+        ackPesan = "RESET_OK";
+        Serial.println("RESET MODAL");
+        break;
+
+    case Command::ResetAll:
+        counters.reset(true, true);
+        ackPesan = "RESET_OK";
+        Serial.println("RESET SEMUA");
+        break;
+
+    case Command::RestartDevice:
+        restartDevice("perintah MQTT");
+        break;
+
+    case Command::Unknown:
+        break;
+    }
 }
 
 // =====================================================
-// MQTT CONNECT
-// =====================================================
-bool connectMQTT()
-{
-  Serial.println("Menghubungkan MQTT...");
-
-  // Tutup socket lama agar tidak menggantung (socket W5500 jumlahnya terbatas)
-  ethClient.stop();
-
-  char clientID[40];
-  snprintf(
-      clientID,
-      sizeof(clientID),
-      "SandingBesar-%08lX",
-      (unsigned long)ESP.getEfuseMac());
-
-  bool connected;
-
-  // Last Will: jika alat putus mendadak, broker otomatis menulis "0"
-  if (strlen(mqtt_user) > 0)
-  {
-    connected = client.connect(clientID, mqtt_user, mqtt_pass,
-                               topicStatus, 0, true, STATUS_OFFLINE);
-  }
-  else
-  {
-    connected = client.connect(clientID, topicStatus, 0, true, STATUS_OFFLINE);
-  }
-
-  if (connected)
-  {
-    Serial.println("MQTT CONNECTED");
-
-    mqttOK = true;
-    mqttErr = 0;
-    mqttRetryDelay = MQTT_RETRY_MIN; // berhasil: jeda dikembalikan ke awal
-
-    client.subscribe(topicPerintah);
-    client.publish(topicMode, hitungAktif ? "ON" : "OFF", true);
-    client.publish(topicStatus, STATUS_ONLINE, true);
-
-    publishCounters();
-    publishIP();
-    diagSegera = true; // laporan diag dikirim oleh networkTask
-
-    lastHeartbeat = millis();
-
-    updateLCD();
-    return true;
-  }
-
-  mqttErr = client.state();
-  if (mqttErr != 0)
-  {
-    lastErrSeen = mqttErr;
-  }
-
-  Serial.print("MQTT gagal, rc=");
-  Serial.print(mqttErr);
-  Serial.print(" (");
-  Serial.print(namaErrorMQTT(mqttErr));
-  Serial.print("), coba lagi dalam ");
-  Serial.print(mqttRetryDelay / 1000);
-  Serial.println(" detik");
-
-  // Gagal: jeda berikutnya digandakan, maksimal 60 detik
-  mqttRetryDelay = min(mqttRetryDelay * 2, MQTT_RETRY_MAX);
-
-  mqttOK = false;
-  updateLCD();
-  return false;
-}
-
-// =====================================================
-// ETHERNET
+// W5500 / ETHERNET
 // lanOK = kabel terpasang DAN sudah punya IP
 // =====================================================
 bool adaIP()
 {
-  return (uint32_t)Ethernet.localIP() != 0;
+    return (uint32_t)Ethernet.localIP() != 0;
 }
 
 // Reset chip W5500 (hard reset jika pin RST disambung), lalu minta IP lagi.
 // Dipakai sebagai langkah pemulihan sebelum restart total.
 void resetEthernet()
 {
-  Serial.println("RESET MODUL ETHERNET (W5500)...");
+    Serial.println("RESET MODUL ETHERNET (W5500)...");
 
-  ethClient.stop();
+    ethClient.stop();
 
 #if W5500_RST_PIN >= 0
-  digitalWrite(W5500_RST_PIN, LOW);
-  delay(50);
-  digitalWrite(W5500_RST_PIN, HIGH);
-  delay(500); // beri waktu chip bangun
+    pinMode(W5500_RST_PIN, OUTPUT);
+    digitalWrite(W5500_RST_PIN, LOW);
+    delay(50);
+    digitalWrite(W5500_RST_PIN, HIGH);
+    delay(500);
 #endif
 
-  Ethernet.init(W5500_CS_PIN);
+    Ethernet.init(W5500_CS_PIN);
 
-  if (Ethernet.begin(mac, 8000, 2000) != 0)
-  {
-    Serial.print("Reset berhasil, IP: ");
-    Serial.println(Ethernet.localIP());
-    lanOK = true;
-  }
-  else
-  {
-    Serial.println("Reset selesai, tapi DHCP belum berhasil.");
-    lanOK = false;
-  }
-}
-
-void cekEthernet()
-{
-  if (Ethernet.linkStatus() == LinkOFF)
-  {
-    // Kabel dianggap putus hanya jika terdeteksi beberapa kali berturut-turut
-    if (linkOffSamples < 255)
+    if (Ethernet.begin(mac, 8000, 2000) != 0)
     {
-      linkOffSamples++;
-    }
-
-    if (linkOffSamples >= LINK_OFF_CONFIRM)
-    {
-      if (linkUp)
-      {
-        lanLostCount++;
-        Serial.println("KABEL LAN PUTUS");
-      }
-      linkUp = false;
-      lanOK = false;
-    }
-    return;
-  }
-
-  // LinkON (atau Unknown): anggap kabel terpasang
-  linkOffSamples = 0;
-
-  if (!linkUp)
-  {
-    Serial.println("Kabel LAN terdeteksi");
-  }
-  linkUp = true;
-
-  if (!adaIP())
-  {
-    // Kabel terpasang tapi belum dapat IP: ulangi DHCP secara berkala
-    lanOK = false;
-
-    unsigned long now = millis();
-
-    if (now - lastDhcpTry >= DHCP_RETRY_INTERVAL)
-    {
-      lastDhcpTry = now;
-
-      Serial.println("Mengulang DHCP...");
-
-      // timeout dipendekkan agar LCD & MQTT tidak lama terhenti
-      if (Ethernet.begin(mac, 8000, 2000) != 0)
-      {
-        Serial.print("DHCP berhasil, IP: ");
+        Serial.print("Reset berhasil, IP: ");
         Serial.println(Ethernet.localIP());
-        lanOK = true;
-      }
     }
-    return;
-  }
-
-  Ethernet.maintain();
-  lanOK = true;
+    else
+    {
+        Serial.println("Reset selesai, tapi DHCP belum berhasil.");
+    }
 }
 
-// =====================================================
-// FILTER SENSOR
-// Mengembalikan true SATU KALI setiap ada hitungan baru.
-// =====================================================
-bool prosesSensor(Sensor &s)
+void logNetEvent(NetEvent event)
 {
-  bool raw = digitalRead(s.pin);
-  unsigned long now = millis();
-
-  // Pembacaan mentah berubah: mulai hitung ulang waktu stabil
-  if (raw != s.lastRaw)
-  {
-    s.lastRaw = raw;
-    s.changeTime = now;
-  }
-
-  // Sensor aktif dan stabil cukup lama: hitung 1
-  if (raw == SENSOR_ACTIVE && s.state != SENSOR_ACTIVE)
-  {
-    if (now - s.changeTime >= PRESS_STABLE_TIME)
+    if (event == NetEvent::DhcpRetrySucceeded)
     {
-      s.state = SENSOR_ACTIVE;
-      return true;
+        Serial.print("DHCP diulang, berhasil. IP: ");
+        Serial.println(Ethernet.localIP());
     }
-  }
-  // Sensor lepas dan stabil cukup lama: siap menghitung lagi
-  else if (raw != SENSOR_ACTIVE && s.state == SENSOR_ACTIVE)
-  {
-    if (now - s.changeTime >= RELEASE_STABLE_TIME)
+    else if (event == NetEvent::DhcpRetryFailed)
     {
-      s.state = raw;
+        Serial.println("DHCP diulang, gagal.");
     }
-  }
-
-  return false;
 }
 
 // =====================================================
 // TOMBOL RESET LOKAL (tombol BOOT)
-// Tanpa delay: tidak menghentikan pembacaan sensor.
+// Tanpa delay: tidak lagi menghentikan pembacaan sensor.
 // =====================================================
 void prosesTombolReset()
 {
-  static bool lastRaw = HIGH;
-  static bool sudahDitangani = false;
-  static unsigned long changeTime = 0;
+    static bool lastRaw = HIGH;
+    static bool sudahDitangani = false;
+    static unsigned long changeTime = 0;
 
-  bool raw = digitalRead(RESET_BUTTON);
-  unsigned long now = millis();
+    bool raw = digitalRead(RESET_BUTTON);
+    unsigned long now = millis();
 
-  if (raw != lastRaw)
-  {
-    lastRaw = raw;
-    changeTime = now;
-  }
-
-  if (now - changeTime >= RESET_DEBOUNCE_TIME)
-  {
-    if (raw == LOW && !sudahDitangani)
+    if (raw != lastRaw)
     {
-      sudahDitangani = true;
-      Serial.println("RESET BUTTON");
-      resetCounters(true, true);
+        lastRaw = raw;
+        changeTime = now;
     }
-    else if (raw == HIGH && sudahDitangani)
+
+    if (now - changeTime >= RESET_DEBOUNCE_TIME)
     {
-      sudahDitangani = false;
+        if (raw == LOW && !sudahDitangani)
+        {
+            sudahDitangani = true;
+            Serial.println("RESET BUTTON");
+            counters.reset(true, true);
+        }
+        else if (raw == HIGH && sudahDitangani)
+        {
+            sudahDitangani = false;
+        }
     }
-  }
 }
 
 // =====================================================
@@ -762,49 +510,45 @@ void prosesTombolReset()
 // =====================================================
 void sensorTask(void *parameter)
 {
-  Serial.println("Sensor Task START");
+    Serial.println("Sensor Task START");
 
-  esp_task_wdt_add(NULL);
+    if (!EspTaskWatchdog::subscribeCurrentTask())
+        Serial.println("PERINGATAN: task tidak terpasang ke watchdog.");
 
-  for (;;)
-  {
-    esp_task_wdt_reset();
+    SensorFilter filterHasilLocal(SENSOR_ACTIVE, PRESS_STABLE_TIME, RELEASE_STABLE_TIME);
+    SensorFilter filterModalLocal(SENSOR_ACTIVE, PRESS_STABLE_TIME, RELEASE_STABLE_TIME);
 
-    // prosesSensor() selalu dipanggil agar filternya tetap jalan
-    bool hitH = prosesSensor(sensorHasil);
-    if (hitH && hitungAktif)
+    filterHasilLocal.begin(digitalRead(SENSOR_HASIL), millis());
+    filterModalLocal.begin(digitalRead(SENSOR_MODAL), millis());
+
+    for (;;)
     {
-      portENTER_CRITICAL(&counterMux);
-      jumlahHasil++;
-      portEXIT_CRITICAL(&counterMux);
+        EspTaskWatchdog::feed();
 
-      counterDirty = true;
+        // Filter SELALU dijalankan agar status sensor tetap sinkron,
+        // walau saklar OFF. Hasilnya baru dipakai kalau saklar ON.
+        bool hitH = filterHasilLocal.update(digitalRead(SENSOR_HASIL), millis());
+        if (hitH && hitungAktif)
+        {
+            counters.incrementHasil();
+            const CounterSnapshot c = counters.snapshot();
+            Serial.print("HASIL +1 = ");
+            Serial.println(c.hasil);
+        }
 
-      unsigned long hasil, modal;
-      bacaCounter(hasil, modal);
-      Serial.print("HASIL +1 = ");
-      Serial.println(hasil);
+        bool hitM = filterModalLocal.update(digitalRead(SENSOR_MODAL), millis());
+        if (hitM && hitungAktif)
+        {
+            counters.incrementModal();
+            const CounterSnapshot c = counters.snapshot();
+            Serial.print("MODAL +1 = ");
+            Serial.println(c.modal);
+        }
+
+        prosesTombolReset();
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    bool hitM = prosesSensor(sensorModal);
-    if (hitM && hitungAktif)
-    {
-      portENTER_CRITICAL(&counterMux);
-      jumlahModal++;
-      portEXIT_CRITICAL(&counterMux);
-
-      counterDirty = true;
-
-      unsigned long hasil, modal;
-      bacaCounter(hasil, modal);
-      Serial.print("MODAL +1 = ");
-      Serial.println(modal);
-    }
-
-    prosesTombolReset();
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
 }
 
 // =====================================================
@@ -813,233 +557,263 @@ void sensorTask(void *parameter)
 // =====================================================
 void networkTask(void *parameter)
 {
-  Serial.println("Network Task START");
+    Serial.println("Network Task START");
 
-  esp_task_wdt_add(NULL); // daftarkan task ini ke watchdog
+    if (!EspTaskWatchdog::subscribeCurrentTask())
+        Serial.println("PERINGATAN: task tidak terpasang ke watchdog.");
 
-  bool prevMqttOK = false;
-  NetState lastLcdState = NS_ONLINE;
+    bool prevMqttOK = false;
 
-  for (;;)
-  {
-    esp_task_wdt_reset(); // "saya masih hidup"
-
-    unsigned long now = millis();
-
-    // -------------------------------------------------
-    // Cek Ethernet berkala
-    // -------------------------------------------------
-    if (now - lastEthCheck >= ETH_CHECK_INTERVAL)
+    for (;;)
     {
-      lastEthCheck = now;
-      cekEthernet();
-      updateLCD();
-    }
+        EspTaskWatchdog::feed();
 
-    // -------------------------------------------------
-    // MQTT
-    // -------------------------------------------------
-    if (lanOK)
-    {
-      if (!client.connected())
-      {
-        mqttOK = false;
+        unsigned long now = millis();
 
-        // Jeda mengikuti backoff (2s -> 60s)
-        if (now - lastMQTTReconnect >= mqttRetryDelay)
+        // -------------------------------------------------
+        // Cek Ethernet berkala
+        // -------------------------------------------------
+        if (now - lastEthCheck >= ETH_CHECK_INTERVAL)
         {
-          lastMQTTReconnect = now;
-          connectMQTT();
+            lastEthCheck = now;
+
+            const bool linkUpSebelum = ethDriver.linkUp();
+            const NetEvent ev = netMonitor.update(now);
+            logNetEvent(ev);
+
+            const bool linkUp = ethDriver.linkUp();
+            const bool hasIP = ethDriver.hasIP();
+
+            if (linkUpSebelum && !linkUp)
+            {
+                lanLostCount++;
+                Serial.println("KABEL LAN PUTUS");
+            }
+            if (linkUp && !linkUpSebelum)
+            {
+                Serial.println("Kabel LAN terdeteksi");
+            }
+
+            updateLCD();
         }
-      }
-      else
-      {
-        mqttOK = true;
-        client.loop();
-      }
+
+        // -------------------------------------------------
+        // MQTT
+        // -------------------------------------------------
+        switch (mqtt.update(netMonitor.isOnline(), now))
+        {
+        case MqttEvent::Connected:
+            Serial.println("MQTT CONNECTED");
+            publishKeadaanAwal();
+            updateLCD();
+            break;
+
+        case MqttEvent::ConnectFailed:
+            lastErrSeen = mqtt.lastState();
+            Serial.print("MQTT gagal, rc=");
+            Serial.print(lastErrSeen);
+            Serial.print(" (");
+            Serial.print(namaErrorMQTT(lastErrSeen));
+            Serial.println("), coba lagi dengan backoff");
+            updateLCD();
+            break;
+
+        case MqttEvent::None:
+            break;
+        }
+
+        // Hitung berapa kali MQTT putus setelah sempat online
+        const bool mqttOK = mqtt.isConnected();
+        if (prevMqttOK && !mqttOK)
+        {
+            mqttLostCount++;
+            Serial.println("MQTT PUTUS");
+        }
+        prevMqttOK = mqttOK;
+
+        // -------------------------------------------------
+        // Catat riwayat gangguan, dilaporkan setelah koneksi pulih
+        // -------------------------------------------------
+        const bool linkUp = ethDriver.linkUp();
+        const bool hasIP = ethDriver.hasIP();
+        const NetState ns = hitungNetState(linkUp, hasIP, mqtt.isConnected());
+
+        if (ns == NS_ONLINE)
+        {
+            if (outageStart != 0)
+            {
+                lastOutageSec = (now - outageStart) / 1000UL;
+                lastOutageCause = outageCause;
+                outageStart = 0;
+                diagSegera = true;
+            }
+            pernahOnline = true;
+        }
+        else if (pernahOnline)
+        {
+            if (outageStart == 0)
+            {
+                outageStart = now;
+                outageCause = ns;
+            }
+            else if (ns < outageCause)
+            {
+                outageCause = ns; // simpan penyebab yang paling parah
+            }
+        }
+
+        // LCD segera diperbarui saat status berubah
+        if (ns != lastLcdState)
+        {
+            lastLcdState = ns;
+            updateLCD();
+        }
+
+        // -------------------------------------------------
+        // Kirim laporan diag: segera setelah konek/pulih, lalu tiap 60 detik
+        // -------------------------------------------------
+        if (mqtt.isConnected() && (diagSegera || now - lastDiag >= DIAG_INTERVAL))
+        {
+            lastDiag = now;
+            diagSegera = false;
+            publishDiag();
+        }
+
+        // -------------------------------------------------
+        // Perintah START / STOP tertunda dari MQTT (atau Serial)
+        // -------------------------------------------------
+        uint8_t c = cmdTertunda;
+        cmdTertunda = 0;
+
+        if (!HITUNG_OTOMATIS)
+        {
+            c = 0; // mode otomatis: START/STOP dari HMI diabaikan
+        }
+
+        if (c == 1) // START
+        {
+            counters.reset(true, true);
+            hitungAktif = true;
+            if (mqtt.isConnected())
+            {
+                const CounterSnapshot s = counters.snapshot();
+                mqtt.publishChange(s.hasil, s.modal, true, nullptr);
+                mqttClient.publish(topicMode, "ON", true);
+                if (KIRIM_ACK)
+                {
+                    mqttClient.publish(topicAck, "START_OK", false);
+                }
+            }
+        }
+        else if (c == 2) // STOP
+        {
+            hitungAktif = false;
+            counters.reset(true, true);
+            if (mqtt.isConnected())
+            {
+                const CounterSnapshot s = counters.snapshot();
+                mqtt.publishChange(s.hasil, s.modal, false, nullptr);
+                mqttClient.publish(topicMode, "OFF", true);
+                if (KIRIM_ACK)
+                {
+                    mqttClient.publish(topicAck, "STOP_OK", false);
+                }
+            }
+        }
+
+        // -------------------------------------------------
+        // Ada perubahan counter dari sensorTask / reset / START / STOP
+        // -------------------------------------------------
+        if (counters.takeDirty())
+        {
+            // Bendera dimatikan SEBELUM membaca counter, jadi
+            // hitungan yang masuk setelah ini tidak ada yang terlewat.
+            perluSimpan = true;
+
+            if (mqtt.isConnected())
+            {
+                const CounterSnapshot c = counters.snapshot();
+                mqtt.publishChange(c.hasil, c.modal, hitungAktif, ackPesan);
+            }
+
+            ackPesan = nullptr;
+            updateLCD();
+        }
+
+        // -------------------------------------------------
+        // Simpan counter ke flash (dibatasi tiap 10 detik)
+        // -------------------------------------------------
+        if (perluSimpan && (now - lastSave >= SAVE_INTERVAL))
+        {
+            lastSave = now;
+            perluSimpan = false;
+            simpanCounter();
+        }
+
+        // -------------------------------------------------
+        // Pemulihan bertingkat
+        // Dihitung hanya jika kabel terpasang tapi MQTT belum OK.
+        // Jika kabel yang putus, restart tidak akan membantu.
+        // -------------------------------------------------
+        bool bermasalah = linkUp && !mqtt.isConnected();
+
+        if (!bermasalah)
+        {
+            problemSince = 0;
+            sudahResetEth = false;
+        }
+        else if (problemSince == 0)
+        {
+            problemSince = now;
+        }
+        else
+        {
+            const unsigned long lama = now - problemSince;
+
+            if (!sudahResetEth && lama > RESET_ETH_AFTER)
+            {
+                sudahResetEth = true;
+                resetEthernet(); // langkah 1: reset chip W5500
+            }
+            else if (lama > RESTART_AFTER)
+            {
+                restartDevice("MQTT/IP bermasalah > 10 menit"); // langkah 2
+            }
+        }
+
+        // -------------------------------------------------
+        // Laporan berkala ke Serial Monitor
+        // -------------------------------------------------
+        if (now - lastReport >= REPORT_INTERVAL)
+        {
+            lastReport = now;
+
+            Serial.print("[LAPORAN] Uptime=");
+            Serial.print(now / 60000UL);
+            Serial.print("m | Kabel=");
+            Serial.print(linkUp ? "ON" : "OFF");
+            Serial.print(" | IP=");
+            Serial.print(hasIP ? "OK" : "NO");
+            Serial.print(" | MQTT=");
+            Serial.print(mqtt.isConnected() ? "OK" : "NO");
+            Serial.print(" | LAN putus=");
+            Serial.print(lanLostCount);
+            Serial.print(" | MQTT putus=");
+            Serial.print(mqttLostCount);
+            Serial.print(" | Heap=");
+            Serial.println(ESP.getFreeHeap());
+        }
+
+        // -------------------------------------------------
+        // Ganti halaman LCD (baris 2 bergantian)
+        // -------------------------------------------------
+        if (lcdView.advancePageIfDue(now))
+        {
+            updateLCD();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-    else
-    {
-      mqttOK = false;
-
-      // Jaringan putus: tutup koneksi lama agar tidak menggantung
-      if (client.connected())
-      {
-        client.disconnect();
-      }
-    }
-
-    // Hitung berapa kali MQTT putus setelah sempat online
-    if (prevMqttOK && !mqttOK)
-    {
-      mqttLostCount++;
-      Serial.println("MQTT PUTUS");
-    }
-    prevMqttOK = mqttOK;
-
-    // -------------------------------------------------
-    // Catat riwayat gangguan, dilaporkan setelah koneksi pulih
-    // -------------------------------------------------
-    NetState ns = hitungNetState();
-
-    if (ns == NS_ONLINE)
-    {
-      if (outageStart != 0)
-      {
-        lastOutageSec = (now - outageStart) / 1000UL;
-        lastOutageCause = outageCause;
-        outageStart = 0;
-        diagSegera = true;
-      }
-      pernahOnline = true;
-    }
-    else if (pernahOnline)
-    {
-      if (outageStart == 0)
-      {
-        outageStart = now;
-        outageCause = ns;
-      }
-      else if (ns < outageCause)
-      {
-        outageCause = ns; // simpan penyebab yang paling parah
-      }
-    }
-
-    // LCD langsung diperbarui saat status berubah (tanpa menunggu 3 detik)
-    if (ns != lastLcdState)
-    {
-      lastLcdState = ns;
-      updateLCD();
-    }
-
-    // Kirim laporan diag: segera setelah konek/pulih, lalu tiap 60 detik
-    if (client.connected() && (diagSegera || now - lastDiag >= DIAG_INTERVAL))
-    {
-      lastDiag = now;
-      diagSegera = false;
-      publishDiag();
-    }
-
-    uint8_t c = cmdTertunda;
-    cmdTertunda = 0;
-
-    if (c == 1) // START
-    {
-      resetCounters(true, true);
-      hitungAktif = true;
-      if (client.connected())
-      {
-        publishCounters();
-        client.publish(topicMode, "ON", true);
-        client.publish(topicAck, "START_OK", false);
-      }
-    }
-    else if (c == 2) // STOP
-    {
-      hitungAktif = false;
-      resetCounters(true, true);
-      if (client.connected())
-      {
-        publishCounters();
-        client.publish(topicMode, "OFF", true);
-        client.publish(topicAck, "STOP_OK", false);
-      }
-    }
-
-    // -------------------------------------------------
-    // Ada perubahan counter dari sensorTask / reset
-    // -------------------------------------------------
-    if (counterDirty)
-    {
-      // Bendera dimatikan SEBELUM membaca counter, jadi
-      // hitungan yang masuk setelah ini tidak ada yang terlewat.
-      counterDirty = false;
-      perluSimpan = true;
-
-      if (client.connected())
-      {
-        publishCounters();
-      }
-
-      updateLCD();
-    }
-
-    // -------------------------------------------------
-    // Simpan counter ke flash (dibatasi tiap 10 detik)
-    // -------------------------------------------------
-    if (perluSimpan && (now - lastSave >= SAVE_INTERVAL))
-    {
-      lastSave = now;
-      perluSimpan = false;
-      simpanCounter();
-    }
-
-    // -------------------------------------------------
-    // Heartbeat (timer sendiri, terpisah dari cek Ethernet)
-    // -------------------------------------------------
-    if (client.connected() && (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL))
-    {
-      lastHeartbeat = millis();
-      client.publish(topicStatus, STATUS_ONLINE, true);
-    }
-
-    // -------------------------------------------------
-    // Pemulihan bertingkat
-    // Dihitung hanya jika kabel terpasang tapi MQTT belum OK.
-    // Jika kabel yang putus, restart tidak akan membantu.
-    // -------------------------------------------------
-    bool bermasalah = linkUp && !mqttOK;
-
-    if (!bermasalah)
-    {
-      problemSince = 0;
-      sudahResetEth = false;
-    }
-    else if (problemSince == 0)
-    {
-      problemSince = now;
-    }
-    else
-    {
-      unsigned long lama = now - problemSince;
-
-      if (!sudahResetEth && lama > RESET_ETH_AFTER)
-      {
-        sudahResetEth = true;
-        resetEthernet(); // langkah 1: reset chip W5500
-      }
-      else if (lama > RESTART_AFTER)
-      {
-        restartDevice("MQTT/IP bermasalah > 10 menit"); // langkah 2
-      }
-    }
-
-    // -------------------------------------------------
-    // Laporan berkala ke Serial Monitor
-    // -------------------------------------------------
-    if (now - lastReport >= REPORT_INTERVAL)
-    {
-      lastReport = now;
-
-      Serial.print("[LAPORAN] Uptime=");
-      Serial.print(now / 60000UL);
-      Serial.print("m | Kabel=");
-      Serial.print(linkUp ? "ON" : "OFF");
-      Serial.print(" | IP=");
-      Serial.print(lanOK ? "OK" : "NO");
-      Serial.print(" | MQTT=");
-      Serial.print(mqttOK ? "OK" : "NO");
-      Serial.print(" | LAN putus=");
-      Serial.print(lanLostCount);
-      Serial.print(" | MQTT putus=");
-      Serial.print(mqttLostCount);
-      Serial.print(" | Heap=");
-      Serial.println(ESP.getFreeHeap());
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(20));
-  }
 }
 
 // =====================================================
@@ -1047,106 +821,124 @@ void networkTask(void *parameter)
 // =====================================================
 void setup()
 {
-  Serial.begin(115200);
-  delay(500);
+    Serial.begin(115200);
+    delay(500);
 
-  Serial.println();
-  Serial.println("==============================");
-  Serial.println("SANDING BESAR");
-  Serial.println("ESP32 + W5500 + LCD 20x4");
-  Serial.println("==============================");
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("SANDING BESAR");
+    Serial.println("ESP32 + W5500 + LCD 20x4");
+    Serial.println("==============================");
 
-  // Pin sensor & tombol
-  pinMode(SENSOR_HASIL, INPUT_PULLUP);
-  pinMode(SENSOR_MODAL, INPUT_PULLUP);
-  pinMode(RESET_BUTTON, INPUT_PULLUP);
+    // Pin sensor & tombol
+    pinMode(SENSOR_HASIL, INPUT_PULLUP);
+    pinMode(SENSOR_MODAL, INPUT_PULLUP);
+    pinMode(RESET_BUTTON, INPUT_PULLUP);
 
-  // Kondisi awal sensor
-  sensorHasil.state = digitalRead(SENSOR_HASIL);
-  sensorHasil.lastRaw = sensorHasil.state;
+    // Kondisi awal sensor
+    const bool hasilAwal = digitalRead(SENSOR_HASIL);
+    const bool modalAwal = digitalRead(SENSOR_MODAL);
 
-  sensorModal.state = digitalRead(SENSOR_MODAL);
-  sensorModal.lastRaw = sensorModal.state;
+    // Muat counter terakhir dari flash (jika fitur aktif)
+    muatCounter();
 
-  // Muat counter terakhir dari flash (jika fitur aktif)
-  muatCounter();
+    // LCD
+    lcdView.begin();
+    lcdView.showMessage("SANDING BESAR", "STARTING...");
+    delay(1500);
 
-  // LCD
-  Wire.begin();
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
-
-  lcdTulisBaris(0, "Veneer Counter 20x4");
-  lcdTulisBaris(1, "SANDING BESAR");
-  lcdTulisBaris(2, "Inisialisasi...");
-  delay(1500);
-  lcd.clear();
-
-  // Pin RST W5500 (hanya jika dipakai): reset chip sekali saat boot
+    // Pin RST W5500 (hanya jika dipakai): reset chip sekali saat boot
 #if W5500_RST_PIN >= 0
-  pinMode(W5500_RST_PIN, OUTPUT);
-  digitalWrite(W5500_RST_PIN, LOW);
-  delay(50);
-  digitalWrite(W5500_RST_PIN, HIGH);
-  delay(500);
+    pinMode(W5500_RST_PIN, OUTPUT);
+    digitalWrite(W5500_RST_PIN, LOW);
+    delay(50);
+    digitalWrite(W5500_RST_PIN, HIGH);
+    delay(500);
 #endif
 
-  // SPI + W5500
-  SPI.begin(W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN, W5500_CS_PIN);
-  Ethernet.init(W5500_CS_PIN);
+    // SPI + W5500
+    SPI.begin(W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN, W5500_CS_PIN);
+    Ethernet.init(W5500_CS_PIN);
 
-  // DHCP (jika gagal, networkTask akan mengulang otomatis)
-  Serial.println("Memulai DHCP...");
+    // MAC & Client ID
+    if (!identity.begin())
+    {
+        Serial.println("PERINGATAN: MAC perangkat tidak valid, jaringan mungkin gagal.");
+    }
+    Serial.print("MAC: ");
+    Serial.println(identity.macText());
+    Serial.print("Client ID: ");
+    Serial.println(identity.clientId());
 
-  if (Ethernet.begin(mac, 8000, 2000) == 0)
-  {
-    Serial.println("DHCP gagal, akan dicoba lagi otomatis.");
-    lanOK = false;
-  }
-  else
-  {
-    lanOK = true;
-    Serial.print("DHCP berhasil, IP: ");
-    Serial.println(Ethernet.localIP());
-  }
+    memcpy(mac, identity.mac(), sizeof(mac));
 
-  linkUp = (Ethernet.linkStatus() != LinkOFF);
+    delay(500);
 
-  // MQTT
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqttCallback);
-  client.setBufferSize(512);  // default 256 byte tidak cukup untuk JSON diag
-  client.setKeepAlive(15);    // detik; menjaga koneksi tetap "terlihat hidup" di NAT router
-  client.setSocketTimeout(3); // detik; agar koneksi gagal tidak menahan task lama
+    Serial.print("Versi: ");
+    Serial.print(firmwareInfo.version());
+    Serial.print(" (build ");
+    Serial.print(firmwareInfo.build());
+    Serial.println(")");
 
-  // LCD awal
-  updateLCD();
+    // DHCP (jika gagal, networkTask akan mengulang otomatis)
+    Serial.println("Memulai DHCP...");
+    if (netMonitor.start())
+    {
+        Serial.print("DHCP berhasil, IP: ");
+        Serial.println(Ethernet.localIP());
+    }
+    else
+    {
+        Serial.println("DHCP gagal, akan dicoba lagi otomatis.");
+    }
 
-  // Watchdog harus aktif sebelum task didaftarkan
-  aktifkanWatchdog();
+    // MQTT
+    mqttClient.setServer(deviceConfig.mqttHost, deviceConfig.mqttPort);
+    mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+    mqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
+    mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
 
-  // Task sensor di core 0
-  xTaskCreatePinnedToCore(
-      sensorTask,
-      "SensorTask",
-      4096,
-      NULL,
-      2,
-      NULL,
-      0);
+    MqttSettings mqttSettings{};
+    snprintf(mqttSettings.clientId, sizeof(mqttSettings.clientId), "%s", identity.clientId());
+    mqttSettings.user = deviceConfig.mqttUser;
+    mqttSettings.pass = deviceConfig.mqttPass;
+    mqttSettings.useLastWill = true;
+    mqttSettings.enabled = ConfigManager::isComplete(deviceConfig);
+    mqtt.begin(mqttSettings);
+    mqtt.onCommand(handleCommand);
 
-  // Task network di core 1
-  xTaskCreatePinnedToCore(
-      networkTask,
-      "NetworkTask",
-      12288,
-      NULL,
-      1,
-      NULL,
-      1);
+    if (!mqttSettings.enabled)
+    {
+        Serial.println("MQTT dinonaktifkan: mqtt_host belum diisi. Ketik 'help' di Serial Monitor.");
+    }
 
-  Serial.println("Semua task berjalan.");
+    // LCD awal
+    updateLCD();
+
+    // Watchdog harus aktif sebelum task didaftarkan
+    aktifkanWatchdog();
+
+    // Task sensor di core 0
+    xTaskCreatePinnedToCore(
+        sensorTask,
+        "SensorTask",
+        SENSOR_TASK_STACK,
+        NULL,
+        SENSOR_TASK_PRIORITY,
+        NULL,
+        SENSOR_TASK_CORE);
+
+    // Task network di core 1
+    xTaskCreatePinnedToCore(
+        networkTask,
+        "NetworkTask",
+        NETWORK_TASK_STACK,
+        NULL,
+        NETWORK_TASK_PRIORITY,
+        NULL,
+        NETWORK_TASK_CORE);
+
+    Serial.println("Semua task berjalan.");
 }
 
 // =====================================================
@@ -1155,5 +947,9 @@ void setup()
 // =====================================================
 void loop()
 {
-  vTaskDelay(pdMS_TO_TICKS(1000));
+    while (Serial.available() > 0)
+    {
+        serialConsole.feed((char)Serial.read());
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
 }

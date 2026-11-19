@@ -1,0 +1,72 @@
+#pragma once
+#include <functional>
+#include <stdint.h>
+#include "command_parser.h"
+#include "imqtt_client.h"
+
+struct MqttSettings
+{
+    char clientId[32];
+    const char *user; // nullptr atau "" = tanpa autentikasi
+    const char *pass;
+    bool useLastWill;
+    bool enabled;
+};
+
+enum class MqttEvent
+{
+    None,
+    Connected,
+    ConnectFailed,
+};
+
+// Mengelola koneksi MQTT: sambung ulang dengan backoff, heartbeat, publish,
+// dan perintah masuk dari HMI.
+// Menggantikan connectMQTT, mqttOK, lastMQTTReconnect, lastHeartbeat, dan semua
+// fungsi publish yang tadinya tersebar di main.cpp.
+class MqttService
+{
+public:
+    using CommandHandler = std::function<void(Command)>;
+
+    explicit MqttService(IMqttClient &client);
+
+    void begin(const MqttSettings &settings);
+    void onCommand(CommandHandler handler);
+
+    // Dipanggil berkala dari networkTask.
+    MqttEvent update(bool networkOnline, uint32_t nowMs);
+
+    bool isConnected();
+    int lastState() const { return lastState_; }
+
+    // Dipanggil pemanggil saat update() mengembalikan Connected.
+    // Urutan: jumlah, jumlah2, mode, ip (semuanya retained).
+    bool publishOnConnect(uint32_t hasil, uint32_t modal, bool aktif, const char *ip);
+
+    // Dipanggil saat counter berubah. Angka SELALU dikirim lebih dulu; jika ada
+    // ack, mode dan ack menyusul, sehingga HMI yang menerima ack pasti sudah
+    // menerima angkanya.
+    void publishChange(uint32_t hasil, uint32_t modal, bool aktif, const char *ack);
+
+    // Laporan diagnosa sebagai JSON, retained, ke config::topicDiag.
+    // Mengembalikan true bila publish diterima klien MQTT.
+    bool publishDiag(const char *json);
+
+private:
+    MqttEvent tryConnect(uint32_t nowMs);
+    void onMessage(const char *topic, const uint8_t *payload, size_t length);
+    bool publishNumber(const char *topic, uint32_t value);
+    bool publishMode(bool aktif);
+
+    IMqttClient &client_;
+    MqttSettings settings_;
+    CommandHandler handler_;
+    bool attempted_;
+    uint32_t lastAttemptMs_;
+    uint32_t retryDelay_;        // jeda backoff sekarang (ms)
+    uint32_t lastHeartbeatMs_;
+    uint32_t nowMs_;             // waktu update() terakhir; dipakai callback yang berjalan di dalam loop()
+    uint32_t connectedAtMs_;     // waktu sambung terakhir yang berhasil
+    int lastState_;
+};
