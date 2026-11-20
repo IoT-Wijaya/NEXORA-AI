@@ -3,8 +3,8 @@
 #include <string.h>
 #include <Ethernet.h>
 #include "sanding_config.h"
-#include "lib/device_identity.h"
-#include "lib/net_link/inet_driver.h"
+#include "../lib/device_identity/device_identity.h"
+#include "../lib/net_link/inet_driver.h"
 
 // Driver W5500 Ethernet controller melalui library Arduino Ethernet
 // (implementasi INetDriver). MAC address diambil dari DeviceIdentity.

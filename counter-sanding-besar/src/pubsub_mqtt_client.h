@@ -1,7 +1,7 @@
 #pragma once
 #include <PubSubClient.h>
 #include "sanding_config.h"
-#include "lib/mqtt_service/imqtt_client.h"
+#include "../lib/mqtt_service/imqtt_client.h"
 
 // Pembungkus PubSubClient sebagai IMqttClient. Klien MQTT aktual yang berjalan pada perangkat.
 // PubSubClient hanya menyimpan penunjuk ke host, tidak menyalinnya,
@@ -15,6 +15,9 @@ public:
     }
 
     void setServer(const char *host, uint16_t port) { client_.setServer(host, port); }
+    void setBufferSize(uint16_t size) { client_.setBufferSize(size); }
+    void setKeepAlive(uint16_t seconds) { client_.setKeepAlive(seconds); }
+    void setSocketTimeout(uint16_t seconds) { client_.setSocketTimeout(seconds); }
 
     bool connected() override { return client_.connected(); }
     bool connect(const MqttConnectParams &p) override

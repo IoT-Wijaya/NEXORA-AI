@@ -1,7 +1,7 @@
 #pragma once
 #include <Preferences.h>
 #include <string.h>
-#include "lib/device_config/iconfig_store.h"
+#include "../lib/device_config/iconfig_store.h"
 
 // Penyimpanan konfigurasi di NVS/Preferences ESP32 (implementasi IConfigStore).
 // Namespace "sanding" dipisahkan dari namespace counter/OTA lainnya.

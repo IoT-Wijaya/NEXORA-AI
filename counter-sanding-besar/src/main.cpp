@@ -155,7 +155,7 @@ void restartDevice(const char *alasan)
 
     if (mqtt.isConnected())
     {
-        ethClient.publish(topicStatus, STATUS_OFFLINE, true);
+        mqttClient.publish(topicStatus, STATUS_OFFLINE, true);
         mqttClient.disconnect();
     }
 
@@ -269,6 +269,27 @@ bool sudahResetEth = false;
 unsigned long lastReport = 0;
 NetState lastLcdState = NS_ONLINE;
 
+const char *namaResetReason()
+{
+    switch (esp_reset_reason())
+    {
+    case ESP_RST_POWERON:
+        return "POWER";
+    case ESP_RST_SW:
+        return "SOFTWARE";
+    case ESP_RST_PANIC:
+        return "PANIC";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+        return "WATCHDOG";
+    case ESP_RST_BROWNOUT:
+        return "BROWNOUT";
+    default:
+        return "LAINNYA";
+    }
+}
+
 // =====================================================
 // LAPORAN DIAGNOSA (JSON, retained, ke topik diag)
 // =====================================================
@@ -303,27 +324,6 @@ void publishDiag()
         firmwareInfo.version());
 
     mqtt.publishDiag(buf);
-}
-
-const char *namaResetReason()
-{
-    switch (esp_reset_reason())
-    {
-    case ESP_RST_POWERON:
-        return "POWER";
-    case ESP_RST_SW:
-        return "SOFTWARE";
-    case ESP_RST_PANIC:
-        return "PANIC";
-    case ESP_RST_INT_WDT:
-    case ESP_RST_TASK_WDT:
-    case ESP_RST_WDT:
-        return "WATCHDOG";
-    case ESP_RST_BROWNOUT:
-        return "BROWNOUT";
-    default:
-        return "LAINNYA";
-    }
 }
 
 // =====================================================
@@ -582,7 +582,6 @@ void networkTask(void *parameter)
             logNetEvent(ev);
 
             const bool linkUp = ethDriver.linkUp();
-            const bool hasIP = ethDriver.hasIP();
 
             if (linkUpSebelum && !linkUp)
             {
@@ -834,10 +833,6 @@ void setup()
     pinMode(SENSOR_HASIL, INPUT_PULLUP);
     pinMode(SENSOR_MODAL, INPUT_PULLUP);
     pinMode(RESET_BUTTON, INPUT_PULLUP);
-
-    // Kondisi awal sensor
-    const bool hasilAwal = digitalRead(SENSOR_HASIL);
-    const bool modalAwal = digitalRead(SENSOR_MODAL);
 
     // Muat counter terakhir dari flash (jika fitur aktif)
     muatCounter();

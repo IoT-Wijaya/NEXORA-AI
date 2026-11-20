@@ -2,7 +2,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include "sanding_config.h"
-#include "lib/lcd_view/ilcd_display.h"
+#include "../lib/lcd_view/ilcd_display.h"
 
 // Driver LCD I2C 20x4 melalui LiquidCrystal_I2C (implementasi ILcdDisplay).
 // Baris: 0..3, kolom: 0..19.
