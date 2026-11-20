@@ -99,11 +99,11 @@ LineRouter serialRouter([](char c)
 
 // =====================================================
 // SAKLAR HITUNG
-// false saat boot: sensor tidak menghitung sampai HMI mengirim START.
-// Filter sensor tetap berjalan saat OFF (agar status sinkron),
-// hanya hasil hitungannya yang dibuang.
+// true saat boot: sensor langsung menghitung tanpa menunggu HMI.
+// START tetap dipakai untuk memulai ulang dari 0, STOP untuk berhenti.
+// Filter sensor selalu berjalan, jadi status tetap sinkron.
 // =====================================================
-volatile bool hitungAktif = false;
+volatile bool hitungAktif = true;
 
 // Balasan yang menunggu dikirim ke HMI ("START_OK", "STOP_OK", "RESET_OK").
 // Diisi dan dibaca HANYA oleh networkTask (callback MQTT berjalan di
@@ -213,7 +213,7 @@ void publishKeadaanAwal()
   // SEMUA publish keadaan awal diterima (dipakai pengawas kesehatan OTA).
   serverProof.begin();
 
-  // Setelah restart, mode "OFF" -> HMI tahu sensor perlu START ulang.
+  // Keadaan counting ikut dikirim agar HMI tahu mesin sedang menghitung.
   serverProof.record(mqtt.publishOnConnect(c.hasil, c.modal, hitungAktif, ip));
 
   // Versi firmware sebagai JSON, retained. Dipanggil sekali setiap MQTT tersambung.
