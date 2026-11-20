@@ -315,6 +315,7 @@ void sensorTask(void *parameter)
 
     prosesTombolReset();
 
+    EspTaskWatchdog::feed();
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
@@ -613,6 +614,7 @@ void networkTask(void *parameter)
     // -------------------------------------------------
     handleLCD();
 
+    EspTaskWatchdog::feed();
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
