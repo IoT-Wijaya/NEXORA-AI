@@ -1,5 +1,5 @@
 #pragma once
-#include <EthernetENC.h>
+#include ETH_HEADER
 
 #include "firmware_downloader.h"
 

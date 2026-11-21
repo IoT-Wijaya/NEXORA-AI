@@ -6,7 +6,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import ci_rilis
-from ci_rilis import RilisError, baca_build_manifest, build_dari_jumlah_commit, cek_naik, versi_dari_tag
+from ci_rilis import (MESIN, RilisError, baca_build_manifest, baca_device_type_manifest, build_dari_jumlah_commit,
+                      cek_jenis_sama, cek_naik, mesin_dari_tag, versi_dari_tag)
 
 
 def signed(build, extra=None):
@@ -27,11 +28,14 @@ class VersiDariTag(unittest.TestCase):
         self.assertEqual(versi_dari_tag("sanding-kecil-v1.2.0"), "fw-v1.2.0")
         self.assertEqual(versi_dari_tag("sanding-kecil-v0.0.1"), "fw-v0.0.1")
         self.assertEqual(versi_dari_tag("sanding-kecil-v10.20.300"), "fw-v10.20.300")
+        self.assertEqual(mesin_dari_tag("sanding-besar-v1.2.0"), ("sanding-besar", "fw-v1.2.0"))
+        self.assertEqual(mesin_dari_tag("sanding-kecil-v1.2.0"), ("sanding-kecil", "fw-v1.2.0"))
 
     def test_tag_salah_ditolak(self):
         for t in ["", "v1.2.0", "sanding-kecil-v1.2", "sanding-kecil-v1.2.0-rc1", "sanding-kecil-v1.2.0\n",
                   "sanding-kecil-v01.2.0", "sanding-kecil-v1.2.x", "Sanding-Kecil-v1.2.0", "xsanding-kecil-v1.2.0",
-                  "sanding-kecil-v1.2.0 ", "refs/tags/sanding-kecil-v1.2.0", "hmi-sanding-v1.2.0"]:
+                  "sanding-kecil-v1.2.0 ", "refs/tags/sanding-kecil-v1.2.0", "hmi-sanding-v1.2.0",
+                  "sanding-sedang-v1.2.0", "sanding-besar-1.2.0", "sanding-besar-v1.2.0-rc1", "sanding-besarv1.2.0"]:
             with self.assertRaises(RilisError, msg=repr(t)):
                 versi_dari_tag(t)
 
@@ -78,7 +82,16 @@ class AntarmukaBarisPerintah(unittest.TestCase):
     def test_versi_mencetak_dua_baris_siap_github_env(self):
         rc, out, _ = jalankan("versi", "--tag", "sanding-kecil-v1.2.0", "--commits", "57")
         self.assertEqual(rc, 0)
-        self.assertEqual(out.splitlines(), ["FW_VERSION=fw-v1.2.0", "FW_BUILD=57"])
+        self.assertEqual(out.splitlines(), [
+            "FW_MESIN=sanding-kecil", "FW_VERSION=fw-v1.2.0", "FW_BUILD=57",
+            "FW_DEVICE_TYPE=sanding-kecil", "FW_BOARD=nodemcu-32s", "PIO_ENV=sanding_kecil"])
+
+    def test_versi_mesin_besar(self):
+        rc, out, _ = jalankan("versi", "--tag", "sanding-besar-v0.3.1", "--commits", "70")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines(), [
+            "FW_MESIN=sanding-besar", "FW_VERSION=fw-v0.3.1", "FW_BUILD=70",
+            "FW_DEVICE_TYPE=sanding-besar", "FW_BOARD=nodemcu-32s", "PIO_ENV=sanding_besar"])
 
     def test_versi_tag_salah_gagal_tanpa_keluaran(self):
         rc, out, err = jalankan("versi", "--tag", "v1", "--commits", "5")
@@ -104,6 +117,52 @@ class AntarmukaBarisPerintah(unittest.TestCase):
             p = Path(d) / "manifest.signed"
             p.write_bytes(b"rusak")
             self.assertEqual(jalankan("cek-naik", "--baru", "11", "--terpasang", str(p))[0], 1)
+
+
+class JenisPerangkat(unittest.TestCase):
+    def test_baca_device_type(self):
+        self.assertEqual(baca_device_type_manifest(signed(5, {"device_type": "sanding-besar"})), "sanding-besar")
+        self.assertIsNone(baca_device_type_manifest(signed(5)))
+        self.assertIsNone(baca_device_type_manifest(signed(5, {"device_type": 7})))
+
+    def test_cek_jenis_sama(self):
+        cek_jenis_sama("sanding-kecil", "sanding-kecil")
+        cek_jenis_sama(None, "sanding-kecil")  # manifest lama tanpa jenis: dibiarkan
+        with self.assertRaises(RilisError):
+            cek_jenis_sama("sanding-besar", "sanding-kecil")
+
+    def test_cek_naik_menolak_manifest_mesin_lain(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "manifest.signed"
+            p.write_bytes(signed(10, {"device_type": "sanding-besar"}))
+            self.assertEqual(jalankan("cek-naik", "--baru", "11", "--terpasang", str(p),
+                                      "--device-type", "sanding-kecil")[0], 1)
+            self.assertEqual(jalankan("cek-naik", "--baru", "11", "--terpasang", str(p),
+                                      "--device-type", "sanding-besar")[0], 0)
+
+
+class SinkronDenganFirmware(unittest.TestCase):
+    """Daftar MESIN di ci_rilis.py harus cocok dengan config firmware, agar tidak ada
+    mesin yang dibangun dengan nama atau folder yang berbeda dari yang dipakai perangkat."""
+
+    INCLUDE = Path(__file__).resolve().parent.parent / "include"
+
+    def test_tiap_mesin_punya_config_yang_cocok(self):
+        import re
+        for slug, m in MESIN.items():
+            berkas = self.INCLUDE / f"{m.pio_env}_config.h"
+            self.assertTrue(berkas.exists(), f"{berkas} tidak ada")
+            teks = berkas.read_text(encoding="utf-8")
+            self.assertEqual(re.search(r'OTA_DEVICE_TYPE\s*=\s*"([^"]+)"', teks)[1], m.device_type, slug)
+            self.assertEqual(re.search(r'OTA_BOARD\s*=\s*"([^"]+)"', teks)[1], m.board, slug)
+            self.assertEqual(re.search(r'#define OTA_DIR "([^"]+)"', teks)[1], f"/fw/{slug}/", slug)
+
+    def test_device_type_lolos_aturan_manifest(self):
+        import re
+        pola = re.compile(r"[a-z0-9-]{1,23}")  # TYPE_RE di make_manifest.py
+        for m in MESIN.values():
+            self.assertIsNotNone(pola.fullmatch(m.device_type))
+            self.assertIsNotNone(pola.fullmatch(m.board))
 
 
 if __name__ == "__main__":

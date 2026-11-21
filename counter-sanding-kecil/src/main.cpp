@@ -4,7 +4,7 @@
 #include "esp_spin_lock.h"
 #include "command_parser.h"
 #include "net_monitor.h"
-#include "enc_driver.h"
+#include "eth_driver.h"
 #include "pubsub_mqtt_client.h"
 #include "mqtt_service.h"
 #include "lcd_view.h"
@@ -52,15 +52,15 @@ LcdView lcdView(lcdDisplay, deviceConfig.machineName, LCD_PAGE_INTERVAL);
 
 EspMacSource macSource;
 DeviceIdentity identity(macSource, config::clientIdPrefix);
-EncDriver encDriver(identity);
-NetMonitor netMonitor(encDriver, DHCP_RETRY_INTERVAL);
+EthDriver ethDriver(identity);
+NetMonitor netMonitor(ethDriver, DHCP_RETRY_INTERVAL);
 
 EthernetClient ethClient;
 PubSubMqttClient mqttClient(ethClient);
 MqttService mqtt(mqttClient);
 
 // =====================================================
-// COUNTER (dibagi antar task, selalu diakses lewat mutex)
+// COUNTER (dibagi antar task, selalu diakses lewat spin lock)
 // =====================================================
 EspSpinLock counterLock;
 CounterStore counters(counterLock);
@@ -69,7 +69,7 @@ CounterStore counters(counterLock);
 FirmwareInfo firmwareInfo(FW_VERSION, FW_BUILD);
 
 // =====================================================
-// OTA STATE MACHINE (dibagi antar task, selalu diakses lewat mutex)
+// OTA STATE MACHINE (dipakai HANYA oleh networkTask; boot bersih di setup() berjalan sebelum task ada)
 // =====================================================
 NvsBlobStore otaBlobStore("ota");
 BlobOtaStore otaStore(otaBlobStore, "state");
@@ -100,8 +100,9 @@ LineRouter serialRouter([](char c)
 // =====================================================
 // SAKLAR HITUNG
 // true saat boot: sensor langsung menghitung tanpa menunggu HMI.
-// START tetap dipakai untuk memulai ulang dari 0, STOP untuk berhenti.
-// Filter sensor selalu berjalan, jadi status tetap sinkron.
+// START memulai ulang dari 0, STOP berhenti dan menolkan angka.
+// Filter sensor selalu berjalan (agar status sinkron); saat berhenti,
+// hanya hasil hitungannya yang dibuang.
 // =====================================================
 volatile bool hitungAktif = true;
 
@@ -213,7 +214,7 @@ void publishKeadaanAwal()
   // SEMUA publish keadaan awal diterima (dipakai pengawas kesehatan OTA).
   serverProof.begin();
 
-  // Keadaan counting ikut dikirim agar HMI tahu mesin sedang menghitung.
+  // Keadaan hitung ikut dikirim agar HMI tahu mesin sedang menghitung atau berhenti.
   serverProof.record(mqtt.publishOnConnect(c.hasil, c.modal, hitungAktif, ip));
 
   // Versi firmware sebagai JSON, retained. Dipanggil sekali setiap MQTT tersambung.
@@ -324,7 +325,7 @@ void sensorTask(void *parameter)
 // OTA
 // Pemasangan sungguhan berjalan pada BOOT BERSIH: di setup(), sebelum task
 // dibuat, sehingga hanya satu thread yang memakai Ethernet. Permintaannya
-// datang dari perintah Serial "ota <build>" (SEMENTARA; kelak dari MQTT) dan
+// datang dari perintah MQTT (handleOtaMqtt) atau perintah Serial "ota <build>", dan
 // dilayani networkTask, pemilik tunggal otaMachine.
 // =====================================================
 OtaRunOutcome jalankanOtaRunner(bool dryRun, uint32_t buildDiminta)
@@ -491,7 +492,7 @@ void prosesPermintaanOta()
 
 // networkTask: firmware baru (Pending) harus membuktikan diri sehat.
 // Sehat = LAN online, MQTT tersambung, DAN broker menerima semua publish keadaan awal
-// boot ini (serverProof). Rollback belum dijalankan (diisi di 20c).
+// boot ini (serverProof). Bila tenggat habis, perangkat restart dan boot berikutnya me-rollback.
 void awasiKesehatanOta(unsigned long now)
 {
   constexpr unsigned long INTERVAL_MS = 1000;
@@ -651,8 +652,8 @@ void setup()
 
   Serial.println();
   Serial.println("==============================");
-  Serial.println("SANDING KECIL");
-  Serial.println("ESP32 + ENC28J60");
+  Serial.println(judulMesin);
+  Serial.println(ringkasanPerangkat);
   Serial.println("==============================");
 
   // Firmware version
@@ -677,10 +678,6 @@ void setup()
   Serial.print(otaStateCode(otaMachine.state()));
   Serial.print(", aksi boot=");
   Serial.println(bootActionCode(aksiBoot));
-  Serial.print(firmwareInfo.version());
-  Serial.print(" (build ");
-  Serial.print(firmwareInfo.build());
-  Serial.println(")");
 
   // Pin sensor & tombol
   pinMode(SENSOR_HASIL, INPUT_PULLUP);
@@ -693,7 +690,7 @@ void setup()
 
   // LCD
   lcdView.begin();
-  lcdView.showMessage("SANDING KECIL", "STARTING...");
+  lcdView.showMessage(judulMesin, "STARTING...");
   delay(1500);
 
   // Rollback: pindahkan slot boot ke firmware lama, lalu restart. Tidak kembali ke setup().
@@ -702,9 +699,9 @@ void setup()
     prosesRollbackBoot();
   }
 
-  // SPI + ENC28J60
-  SPI.begin(ENC_SCK, ENC_MISO, ENC_MOSI, ENC_CS_PIN);
-  Ethernet.init(ENC_CS_PIN);
+  // SPI + chip Ethernet (ENC28J60 atau W5500, sesuai config mesin)
+  SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, ETH_CS_PIN);
+  Ethernet.init(ETH_CS_PIN);
 
   // DHCP (jika gagal, networkTask akan mengulang otomatis)
   Serial.println("Memulai DHCP...");

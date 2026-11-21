@@ -1,20 +1,22 @@
 #pragma once
+#include "sanding_config.h" // harus pertama: mendefinisikan ETH_HEADER
 #include <SPI.h>
 #include <string.h>
-#include <EthernetENC.h>
-#include "sanding_config.h"
+#include ETH_HEADER // dipilih per mesin: EthernetENC (ENC28J60) atau Ethernet (W5500)
 #include "device_identity.h"
 #include "inet_driver.h"
 
-class EncDriver : public INetDriver
+// Driver Ethernet untuk ENC28J60 maupun W5500: kedua pustaka memakai API yang sama,
+// jadi bedanya hanya header di ETH_HEADER dan pin di config.
+class EthDriver : public INetDriver
 {
 public:
-    explicit EncDriver(const DeviceIdentity &identity) : identity_(identity) {}
+    explicit EthDriver(const DeviceIdentity &identity) : identity_(identity) {}
 
     void begin() override
     {
-        SPI.begin(config::ENC_SCK, config::ENC_MISO, config::ENC_MOSI, config::ENC_CS_PIN);
-        Ethernet.init(config::ENC_CS_PIN);
+        SPI.begin(config::ETH_SCK, config::ETH_MISO, config::ETH_MOSI, config::ETH_CS_PIN);
+        Ethernet.init(config::ETH_CS_PIN);
     }
     bool linkUp() override { return Ethernet.linkStatus() == LinkON; }
     bool hasIP() override { return (uint32_t)Ethernet.localIP() != 0; }

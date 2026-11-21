@@ -1,29 +1,30 @@
-name: Rilis Firmware Sanding Kecil
+name: Rilis Firmware
 
-# Dipicu tag sanding-kecil-vX.Y.Z (pola ketat diperiksa tools/ci_rilis.py).
+# Dipicu tag <mesin>-vX.Y.Z, mis. sanding-kecil-v1.2.0 atau sanding-besar-v1.2.0.
+# Mesin, env PlatformIO, jenis perangkat, dan folder rilis diturunkan dari tag oleh tools/ci_rilis.py.
 # Alur: tes -> build -> manifest bertanda tangan -> pasang di VPS -> verifikasi dari luar -> GitHub Release.
 on:
   push:
     tags:
       - "sanding-kecil-v*"
+      - "sanding-besar-v*"
 
 permissions:
   contents: read
 
-# Satu rilis pada satu waktu; rilis kedua menunggu, tidak dibatalkan di tengah jalan.
+# Satu rilis pada satu waktu (semua mesin); rilis kedua menunggu, tidak dibatalkan di tengah jalan.
 concurrency:
-  group: rilis-sanding-kecil
+  group: rilis-firmware
   cancel-in-progress: false
 
 # Semua perintah run berjalan di folder proyek PlatformIO (tempat platformio.ini dan tools/ berada).
-# GANTI_FOLDER dengan nama folder itu; ganti juga pada dua baris hashFiles di bawah.
+# Ganti counter-sanding-kecil bila nama folder berubah; ganti juga pada dua baris hashFiles di bawah.
 defaults:
   run:
     working-directory: counter-sanding-kecil
 
 env:
   PLATFORMIO_VERSION: "6.1.18" # samakan dengan `pio --version` di komputer Anda
-  PIO_ENV: sanding_kecil
 
 jobs:
   tes:
@@ -80,8 +81,9 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
             || { echo "GAGAL: tag $GITHUB_REF_NAME tidak berada di riwayat main"; exit 1; }
 
-      - name: Tentukan versi dan nomor build
+      - name: Tentukan mesin, versi, dan nomor build
         run: |
+          # Menurunkan FW_MESIN, FW_VERSION, FW_BUILD, FW_DEVICE_TYPE, FW_BOARD, PIO_ENV dari nama tag.
           python3 tools/ci_rilis.py versi --tag "$GITHUB_REF_NAME" --commits "$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
@@ -98,7 +100,7 @@ jobs:
 
       - name: Build firmware
         run: |
-          echo "Membangun $FW_VERSION (build $FW_BUILD)"
+          echo "Membangun $FW_MESIN $FW_VERSION (build $FW_BUILD) dengan env $PIO_ENV"
           pio run -e "$PIO_ENV"
           cp ".pio/build/$PIO_ENV/firmware.bin" firmware.bin
 
@@ -114,7 +116,8 @@ jobs:
           umask 077
           KEY="$RUNNER_TEMP/ota_rahasia.pem"
           printf '%s\n' "$OTA_SIGNING_KEY" > "$KEY"
-          python3 tools/make_manifest.py firmware.bin --version "$FW_VERSION" --build "$FW_BUILD" -o manifest.json
+          python3 tools/make_manifest.py firmware.bin --version "$FW_VERSION" --build "$FW_BUILD" \
+            --device-type "$FW_DEVICE_TYPE" --board "$FW_BOARD" -o manifest.json
           bash tools/sign_manifest.sh manifest.json "$KEY" manifest.signed
 
       - name: Hapus kunci rahasia dari runner
@@ -133,35 +136,31 @@ jobs:
           printf 'Host vps\n  HostName %s\n  Port %s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n  BatchMode yes\n  StrictHostKeyChecking yes\n' \
             "$VPS_HOST" "${VPS_PORT:-22}" "$VPS_USER" > ~/.ssh/config
 
-      - name: Diagnosis sementara
-        run: |
-          echo "jumlah baris known_hosts: $(wc -l < ~/.ssh/known_hosts)"
-          echo "tipe kunci: $(awk '{print $2}' ~/.ssh/known_hosts | tr '\n' ' ')"
-          ssh-keygen -F "[$VPS_HOST]:${VPS_PORT:-22}" > /dev/null && echo "ENTRI DITEMUKAN" || echo "ENTRI TIDAK ADA untuk host:port ini"
-
       - name: Pastikan nomor build lebih besar dari yang terpasang
         run: |
           # Variabel di dalam perintah ssh sengaja diperluas di sisi runner (nilainya dari konfigurasi tepercaya).
+          # Setiap mesin punya folder sendiri: $VPS_FW_DIR/<mesin>/ (disajikan nginx di /fw/<mesin>/).
           rm -f terpasang.signed
-          if ssh vps "test -f '$VPS_FW_DIR/manifest.signed'"; then
-            scp -q "vps:$VPS_FW_DIR/manifest.signed" terpasang.signed
+          if ssh vps "test -f '$VPS_FW_DIR/$FW_MESIN/manifest.signed'"; then
+            scp -q "vps:$VPS_FW_DIR/$FW_MESIN/manifest.signed" terpasang.signed
           fi
-          python3 tools/ci_rilis.py cek-naik --baru "$FW_BUILD" --terpasang terpasang.signed
+          python3 tools/ci_rilis.py cek-naik --baru "$FW_BUILD" --terpasang terpasang.signed --device-type "$FW_DEVICE_TYPE"
 
       - name: Pasang di VPS
         run: |
           # Variabel di dalam perintah ssh sengaja diperluas di sisi runner (nilainya dari konfigurasi tepercaya).
-          MASUK="ota-masuk/$FW_BUILD"
-          ssh vps "rm -rf '$MASUK' && mkdir -p '$MASUK'"
+          MASUK="ota-masuk/$FW_MESIN-$FW_BUILD"
+          TUJUAN="$VPS_FW_DIR/$FW_MESIN"
+          ssh vps "rm -rf '$MASUK' && mkdir -p '$MASUK' '$TUJUAN'"
           scp -q firmware.bin manifest.signed tools/pasang_di_vps.sh "vps:$MASUK/"
-          ssh vps "bash '$MASUK/pasang_di_vps.sh' '$MASUK' '$VPS_FW_DIR' 10"
+          ssh vps "bash '$MASUK/pasang_di_vps.sh' '$MASUK' '$TUJUAN' 10"
           ssh vps "rm -rf '$MASUK'"
 
       - name: Verifikasi dari luar (HTTP port 80, tanpa pengalihan)
         run: |
           for berkas in manifest.signed firmware.bin; do
             curl --fail --silent --show-error --max-redirs 0 --max-time 60 \
-              "http://$OTA_PUBLIC_HOST/fw/$berkas" -o "diunduh-$berkas"
+              "http://$OTA_PUBLIC_HOST/fw/$FW_MESIN/$berkas" -o "diunduh-$berkas"
             cmp "$berkas" "diunduh-$berkas" || { echo "GAGAL: $berkas di server berbeda dari hasil build"; exit 1; }
           done
 
@@ -170,5 +169,5 @@ jobs:
           SHA="$(sha256sum firmware.bin | cut -d' ' -f1)"
           gh release create "$GITHUB_REF_NAME" firmware.bin manifest.signed \
             --verify-tag \
-            --title "Sanding Kecil $FW_VERSION (build $FW_BUILD)" \
-            --notes "Build $FW_BUILD, sha256 firmware: $SHA"
+            --title "$FW_MESIN $FW_VERSION (build $FW_BUILD)" \
+            --notes "Mesin $FW_MESIN, build $FW_BUILD, sha256 firmware: $SHA"

@@ -6,7 +6,7 @@ namespace LcdFormat
 
     void counterLine(char *out, size_t size, const LcdState &s)
     {
-        // Karakter terakhir: '*' = sedang menghitung, '-' = berhenti (menunggu START).
+        // Karakter terakhir: '*' = sedang menghitung, '-' = berhenti.
         snprintf(out, size, "M:%5lu H:%5lu%c", (unsigned long)s.modal, (unsigned long)s.hasil,
                  s.counting ? '*' : '-');
     }
@@ -21,6 +21,11 @@ namespace LcdFormat
         snprintf(out, size, "LAN:%s MQTT:%s", lanOk ? "OK" : "NO", mqttOk ? "OK" : "NO");
     }
 
+    void countingLine(char *out, size_t size, bool counting)
+    {
+        snprintf(out, size, "HITUNG:%s", counting ? "AKTIF" : "BERHENTI");
+    }
+
     void pad(char *out, size_t size, const char *text)
     {
         snprintf(out, size, "%-*s", (int)(size - 1), text);
@@ -28,29 +33,44 @@ namespace LcdFormat
 
 } // namespace LcdFormat
 
-LcdView::LcdView(ILcdDisplay &display, const char *machineName, uint32_t pageIntervalMs)
-    : display_(display), machineName_(machineName), pageIntervalMs_(pageIntervalMs),
+LcdView::LcdView(ILcdDisplay &display, const char *machineName, uint32_t pageIntervalMs, uint8_t rows)
+    : display_(display), machineName_(machineName), pageIntervalMs_(pageIntervalMs), rows_(rows),
       machinePage_(false), lastChangeMs_(0) {}
 
 void LcdView::begin() { display_.begin(); }
 
-void LcdView::showMessage(const char *line1, const char *line2)
+void LcdView::writePadded(uint8_t row, const char *text)
 {
     char line[LCD_LINE_SIZE];
-    LcdFormat::pad(line, sizeof(line), line1);
-    display_.writeLine(0, line);
-    LcdFormat::pad(line, sizeof(line), line2);
-    display_.writeLine(1, line);
+    LcdFormat::pad(line, sizeof(line), text);
+    display_.writeLine(row, line);
+}
+
+void LcdView::showMessage(const char *line1, const char *line2)
+{
+    writePadded(0, line1);
+    writePadded(1, line2);
+    for (uint8_t row = 2; row < rows_; ++row)
+        writePadded(row, ""); // hapus sisa tampilan lama
 }
 
 void LcdView::render(const LcdState &s)
 {
     char raw[LCD_LINE_SIZE];
-    char line[LCD_LINE_SIZE];
 
     LcdFormat::counterLine(raw, sizeof(raw), s);
-    LcdFormat::pad(line, sizeof(line), raw);
-    display_.writeLine(0, line);
+    writePadded(0, raw);
+
+    if (rows_ >= LCD_ROWS_SEMUA_SEKALIGUS)
+    {
+        LcdFormat::machineLine(raw, sizeof(raw), machineName_);
+        writePadded(1, raw);
+        LcdFormat::networkLine(raw, sizeof(raw), s.lanOk, s.mqttOk);
+        writePadded(2, raw);
+        LcdFormat::countingLine(raw, sizeof(raw), s.counting);
+        writePadded(3, raw);
+        return;
+    }
 
     if (machinePage_)
     {
@@ -60,8 +80,7 @@ void LcdView::render(const LcdState &s)
     {
         LcdFormat::networkLine(raw, sizeof(raw), s.lanOk, s.mqttOk);
     }
-    LcdFormat::pad(line, sizeof(line), raw);
-    display_.writeLine(1, line);
+    writePadded(1, raw);
 }
 
 void LcdView::restartPageTimer(uint32_t nowMs)
@@ -72,6 +91,8 @@ void LcdView::restartPageTimer(uint32_t nowMs)
 
 bool LcdView::advancePageIfDue(uint32_t nowMs)
 {
+    if (rows_ >= LCD_ROWS_SEMUA_SEKALIGUS)
+        return false; // semua baris sudah tampil, tidak ada halaman
     // Selisih unsigned tetap benar walau millis() melewati batas 32 bit.
     if (nowMs - lastChangeMs_ < pageIntervalMs_)
         return false;
